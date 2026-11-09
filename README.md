@@ -51,3 +51,10 @@ pip install torch numpy matplotlib
 | `outputs/*_v2.png` | 改名去掉 `_v2`；V1 舊圖移除 |
 | `test.py`、`pytest.ai`、`R2新增功能筆記.txt` | 移除（只有 `print("123")` 或空檔） |
 | `__pycache__/` | 移除；`.vscode/` 保留在本機但不進 git |
+
+## 變更紀錄
+
+每次 commit 後由 Claude 讀取變更內容整理，新的在最上面。
+
+<!-- CHANGELOG:START -->
+<!-- CHANGELOG:END -->
