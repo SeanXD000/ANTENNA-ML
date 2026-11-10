@@ -54,13 +54,15 @@ def rmse_db(model, p, f, y, norm):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default=DATA_DIR)
+    ap.add_argument("--exclude", nargs="*", default=None,
+                    help="略過的檔名樣式（預設同 antenna_ml.py：W4*）")
     ap.add_argument("--band", default="6E", choices=list(WIFI_BANDS))
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--lr", type=float, default=5e-5, help="微調學習率；太大 (如 2e-4) 會先把已收斂的模型打亂")
     args = ap.parse_args()
     bands = WIFI_BANDS[args.band]
 
-    runs, design_params, fixed = load_all_runs(args.data)
+    runs, design_params, fixed = load_all_runs(args.data, args.exclude)
     print(f"成功載入 {len(runs)} 組模擬，設計變數：{design_params}")
 
     if not os.path.exists(MODEL_PATH):

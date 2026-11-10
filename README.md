@@ -20,15 +20,20 @@ pip install torch numpy matplotlib
 ## 使用
 
 1. 把 CST 參數掃描匯出的 `.txt` / `.dat` 放進 `data/`（格式：每組模擬以 `#Parameters = {...}` 開頭，接著是「頻率 GHz、S11 dB」兩欄）。
+   - 目前的資料是槽孔天線的 4 個單參數掃描：`Wslot1`、`Wslot2`、`Wslot3`、`Ymax`（設計變數 `W_slot1`、`W_slot2`、`W_slot3`、`Ymax`，2–8 GHz）。
+   - 舊天線的 `W4(0_13).txt` 參數名稱不同，預設會被略過（`--exclude`，預設 `W4*`）。若混入參數名稱不一致的檔案，程式會停下來並列出是哪些檔案。
 2. 訓練 + 最佳化：
 
    ```bash
-   python antenna_ml.py                  # 預設目標 6E 頻段
-   python antenna_ml.py --band WIFI7     # 2G4 / 5G / 6E / WIFI7
-   python antenna_ml.py --skip-validate  # 跳過留一驗證
+   python antenna_ml.py                          # 預設目標 6E 頻段
+   python antenna_ml.py --band WIFI7             # 2G4 / 5G / 6E / WIFI7
+   python antenna_ml.py --skip-validate          # 跳過留一驗證
+   python antenna_ml.py --holdout W_slot2=12     # 指定驗證要藏的樣本（參數=數值）
+   python antenna_ml.py --trust-radius 0.1       # 只搜尋離 CST 樣本 10% 參數範圍以內的組合
    ```
 
-   產出：`antenna_surrogate.pth`（模型）、`outputs/validation.png`、`outputs/optimize_<band>.png`。
+   產出：`antenna_surrogate.pth`（模型）、`outputs/validation.png`、`outputs/sweeps.png`（每條掃描線的 CST vs 模型熱圖）、`outputs/optimize_<band>.png`。
+   未指定 `--epochs` 時會依資料量自動決定（每個模型約 1 萬次更新）；目前約 10 萬個頻點，對應 400 epochs。
 3. 補跑 CST 後微調：
 
    ```bash

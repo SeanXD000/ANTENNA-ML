@@ -6,7 +6,8 @@
 
 流程：
  1. 讀取 CST 參數掃描匯出的 .txt（一個檔案含多組 #Parameters 區塊）
- 2. 自動找出有變動的設計參數（例如 W4）當作模型輸入
+    預設排除舊天線的 W4*.txt（參數名稱不同，不能混在一起訓練），見 EXCLUDE_PATTERNS / --exclude
+ 2. 自動找出有變動的設計參數（目前為 W_slot1, W_slot2, W_slot3, Ymax）當作模型輸入
  3. 訓練代理模型 (Surrogate)： [設計參數, 頻率] -> S11 (dB)
  4. 留一驗證：藏起部分資料不訓練，看模型能否預測出那條曲線
  5. 用代理模型在連續的參數空間細掃，找出 WiFi 頻段表現最好的設計
@@ -19,14 +20,21 @@ V2 相對 V1 的升級重點：
  5. 多頻段平衡評分：修正 WIFI7 三頻段因頻點數不同導致偏心 6E 而犧牲 2.4G 的問題
  6. 支援 GPU (CUDA) 自動加速與 Normalizer 防除零保護
 
+資料形狀注意：目前 data/ 是 4 個「一次只改一個參數」的掃描（每個檔案掃一個參數，其餘固定），
+在 4 維參數空間裡只是幾條線，不是填滿的網格。所以 4 個參數以上時，最佳化只在「已模擬過的點附近」
+搜尋（--trust-radius），離資料太遠的組合模型沒有依據，預測不可信。
+
 用法：
   python antenna_ml.py                         # 驗證 + 訓練 + 最佳化 (自動支援單/多參數)
   python antenna_ml.py --band WIFI7            # 目標頻段: 6E / 5G / 2G4 / WIFI7
-  python antenna_ml.py --holdout 6 10          # 指定驗證時要藏起來的參數值（第一個設計變數）
+  python antenna_ml.py --holdout W_slot2=12 Ymax=6   # 指定驗證時要藏起來的樣本（參數=數值）
   python antenna_ml.py --n-ensemble 5          # 使用 5 個模型集成並繪製不確定性陰影帶
   python antenna_ml.py --skip-validate         # 直接用全部資料訓練
+  python antenna_ml.py --exclude "W4*" "old_*" # 排除的檔名樣式（預設 W4*）；只寫 --exclude 不帶值 = 全部讀
+  python antenna_ml.py --epochs 300            # 指定 epochs；不指定則依資料量自動決定
 """
 import argparse
+import fnmatch
 import glob
 import itertools
 import os
@@ -44,6 +52,9 @@ DATA_DIR = "./data"
 OUT_DIR = "./outputs"
 MODEL_PATH = "antenna_surrogate.pth"  # iterative_train.py 也讀寫這個檔
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 預設不讀的檔案：W4*.txt 是舊天線（參數 H, L, W, W4...），和現在的槽孔天線（W_slot1/2/3, Ymax...）不是同一個設計
+EXCLUDE_PATTERNS = ["W4*"]
+TARGET_STEPS = 10000  # 未指定 --epochs 時，每個模型的目標更新步數（舊 W4 資料 2500 epochs ≈ 1 萬步）
 
 # WiFi 頻段 (GHz)
 WIFI_BANDS = {
@@ -103,17 +114,47 @@ def parse_cst_sweep(file_path):
     return valid_runs
 
 
-def load_all_runs(data_dir):
+def load_all_runs(data_dir, exclude=None):
+    """讀取資料夾內所有 CST 匯出檔。exclude：要略過的檔名樣式（fnmatch），None = 用 EXCLUDE_PATTERNS。
+    每組模擬會加上 "source"（來源檔名，不含副檔名），用來分組驗證與畫圖。"""
+    exclude = EXCLUDE_PATTERNS if exclude is None else exclude
     files = sorted(glob.glob(os.path.join(data_dir, "*.txt")) + glob.glob(os.path.join(data_dir, "*.dat")))
+    skipped = [fp for fp in files if any(fnmatch.fnmatch(os.path.basename(fp), pat) for pat in exclude)]
+    files = [fp for fp in files if fp not in skipped]
+    for fp in skipped:
+        print(f"略過 {os.path.basename(fp)}（符合排除樣式 {exclude}）")
     if not files:
-        raise FileNotFoundError(f"在 '{data_dir}' 找不到任何 .txt / .dat 檔案")
+        raise FileNotFoundError(f"在 '{data_dir}' 找不到任何 .txt / .dat 檔案（排除樣式 {exclude}）")
     runs = []
     for fp in files:
         rs = parse_cst_sweep(fp)
+        src = os.path.splitext(os.path.basename(fp))[0]
+        for r in rs:
+            r["source"] = src
         print(f"讀取 {os.path.basename(fp)}：{len(rs)} 組模擬")
         runs.extend(rs)
     if not runs:
         raise ValueError("讀取到的模擬資料為空，請確認 CST 匯出檔格式是否包含 #Parameters {...}")
+
+    # 所有檔案必須是同一個天線（參數名稱相同），否則無法放進同一個模型
+    key_sets = {}
+    for r in runs:
+        key_sets.setdefault(tuple(sorted(r["params"])), set()).add(r["source"])
+    if len(key_sets) > 1:
+        detail = "\n".join(f"  {sorted(srcs)}: {list(keys)}" for keys, srcs in key_sets.items())
+        raise ValueError("不同檔案的參數名稱不一致，看起來是不同的天線設計，不能一起訓練：\n"
+                         f"{detail}\n請用 --exclude 排除其中一組（例如 --exclude \"W4*\"）。")
+
+    # 不同掃描檔可能在交會點重複模擬同一組參數（例如 W_slot2=14 & W_slot3=8），只保留一份
+    seen, unique = {}, []
+    for r in runs:
+        key = tuple(sorted(r["params"].items()))
+        if key in seen:
+            print(f"  {r['source']} 有一組參數與 {seen[key]} 重複，只保留一份")
+            continue
+        seen[key] = r["source"]
+        unique.append(r)
+    runs = unique
 
     # 自動找出所有出現過的參數，並判斷有變動的參數 => 設計變數（如多個溝槽數值）
     all_keys = sorted({k for r in runs for k in r["params"]})
@@ -204,9 +245,19 @@ def compute_sample_weights(F, Y, bands):
     return w / np.mean(w)
 
 
-def train_ensemble(runs, design_params, bands, epochs=2500, n_ensemble=5, verbose=True):
-    """訓練多個代理模型組成 Ensemble，用於預測平均值與不確定性（標準差）。"""
+def auto_epochs(n_points, bs=4096, target_steps=TARGET_STEPS):
+    """依資料量決定 epochs：讓每個模型大約更新 target_steps 次。
+    資料多時每個 epoch 步數多，epochs 就少；避免 10 萬頻點 × 2500 epochs 在 CPU 上跑好幾小時。"""
+    steps_per_epoch = max(1, int(np.ceil(n_points / min(bs, n_points))))
+    return int(min(2500, max(200, round(target_steps / steps_per_epoch))))
+
+
+def train_ensemble(runs, design_params, bands, epochs=None, n_ensemble=5, verbose=True):
+    """訓練多個代理模型組成 Ensemble，用於預測平均值與不確定性（標準差）。
+    epochs=None 時依資料量自動決定（見 auto_epochs）。"""
     P, F, Y = runs_to_arrays(runs, design_params)
+    if epochs is None:
+        epochs = auto_epochs(len(Y))
     norm = Normalizer(P.min(0), P.max(0), F.min(), F.max(), Y.mean(), Y.std())
     weights = compute_sample_weights(F, Y, bands)
 
@@ -341,8 +392,10 @@ def format_params(design_params, values):
     return ", ".join(f"{k}={v:g}" for k, v in zip(design_params, values))
 
 
-def generate_search_grid(runs, design_params, max_total_points=5000):
-    """自動根據參數數量建立搜尋網格（支援 1D 細掃、2D/3D 網格、高維度隨機取樣）。"""
+def generate_search_grid(runs, design_params, max_total_points=5000, trust_radius=0.15):
+    """自動根據參數數量建立搜尋網格（支援 1D 細掃、2D/3D 網格、高維度局部取樣）。
+    4 個參數以上：只在「已模擬過的點附近」取樣（正規化到 [0,1] 後，距離 ≤ trust_radius），
+    因為一次掃一個參數的資料只覆蓋幾條線，離線太遠的組合模型是在瞎猜。"""
     n_p = len(design_params)
     bounds = []
     for k in design_params:
@@ -360,12 +413,105 @@ def generate_search_grid(runs, design_params, max_total_points=5000):
         combos = np.array(list(itertools.product(*axes)), dtype=float)
         return combos, axes
     else:
-        # 4 個參數以上使用均勻隨機/準蒙地卡羅抽樣避免維度爆炸
+        # 4 個參數以上：以每個 CST 樣本為中心做局部隨機擾動（信任區域），並包含樣本點本身
         rng = np.random.default_rng(42)
-        combos = np.zeros((max_total_points, n_p), dtype=float)
-        for idx, (lo, hi) in enumerate(bounds):
-            combos[:, idx] = np.round(rng.uniform(lo, hi, size=max_total_points), 3)
-        return combos, None
+        lo = np.array([b[0] for b in bounds])
+        hi = np.array([b[1] for b in bounds])
+        span = np.where(hi - lo > 1e-8, hi - lo, 1.0)
+        centers = np.array([[r["params"][k] for k in design_params] for r in runs], dtype=float)
+        n_rand = max(0, max_total_points - len(centers))
+        picks = centers[rng.integers(0, len(centers), size=n_rand)]
+        # 在正規化空間的球內均勻取樣（半徑 trust_radius）：同時改多個參數時，總偏移量仍受限
+        direc = rng.normal(size=(n_rand, n_p))
+        direc /= np.linalg.norm(direc, axis=1, keepdims=True)
+        radius = trust_radius * rng.uniform(size=(n_rand, 1)) ** (1.0 / n_p)
+        offsets = direc * radius * span
+        combos = np.vstack([centers, np.clip(picks + offsets, lo, hi)])
+        return np.round(combos, 3), None
+
+
+def parse_holdout(specs, design_params):
+    """把 ["W_slot2=12", "Ymax=6"] 轉成 [("W_slot2", 12.0), ("Ymax", 6.0)]。
+    只有一個設計變數時，也接受純數字（舊用法 --holdout 6 10）。"""
+    out = []
+    for s in specs:
+        if "=" in s:
+            k, v = s.split("=", 1)
+            k = k.strip()
+            if k not in design_params:
+                raise SystemExit(f"--holdout 的參數 {k} 不是設計變數 {design_params}")
+            out.append((k, float(v)))
+        elif len(design_params) == 1:
+            out.append((design_params[0], float(s)))
+        else:
+            raise SystemExit(f"多參數時 --holdout 要寫成 參數=數值，例如 {design_params[0]}=10")
+    return out
+
+
+def group_by_source(runs):
+    groups = {}
+    for r in runs:
+        groups.setdefault(r.get("source", ""), []).append(r)
+    return groups
+
+
+def swept_param(rs, design_params):
+    """一個掃描檔裡真正有在變的參數（一次只掃一個參數時就是那一個）。"""
+    varying = [k for k in design_params if len({r["params"][k] for r in rs}) > 1]
+    return varying[0] if varying else design_params[0]
+
+
+def default_holdout(runs, design_params):
+    """自動挑驗證樣本：每個來源檔（每條掃描線）各藏 1 組位於中間的樣本，避免選到邊界外插。
+    只有一個來源檔時，沿用舊做法：排序後 1/3 與 2/3 位置各藏 1 組。"""
+    groups = group_by_source(runs)
+    key = lambda r: [r["params"][k] for k in design_params]
+    if len(groups) == 1:
+        rs = sorted(runs, key=key)
+        return [rs[i] for i in sorted({len(rs) // 3, (len(rs) * 2) // 3})]
+    held = []
+    for src in sorted(groups):
+        rs = groups[src]
+        k = swept_param(rs, design_params)
+        rs = sorted(rs, key=lambda r: r["params"][k])
+        if len(rs) >= 3:
+            held.append(rs[len(rs) // 2])
+    return held
+
+
+def plot_sweeps(runs, design_params, models, norm, bands, out_path):
+    """每個來源檔（一條掃描線）畫一列：左 = CST 原始 S11 熱圖，右 = 代理模型在同一條線上的預測。
+    兼做資料探索 (EDA)：看共振頻率怎麼隨參數移動。"""
+    groups = group_by_source(runs)
+    n = len(groups)
+    fig, axes = plt.subplots(n, 2, figsize=(13, 3.4 * n), squeeze=False)
+    for row, src in enumerate(sorted(groups)):
+        rs = groups[src]
+        k = swept_param(rs, design_params)
+        rs = sorted(rs, key=lambda r: r["params"][k])
+        vals = np.array([r["params"][k] for r in rs])
+        freq = rs[0]["freq"]
+        raw = np.array([np.interp(freq, r["freq"], r["s11"]) for r in rs])
+        fine_vals = np.linspace(vals[0], vals[-1], 120)
+        base = np.array([rs[len(rs) // 2]["params"][d] for d in design_params], dtype=float)
+        grid = np.tile(base, (len(fine_vals), 1))
+        grid[:, design_params.index(k)] = fine_vals
+        pred, _ = predict_curves_batch(models, norm, grid, freq)
+        fixed_txt = ", ".join(f"{d}={base[i]:g}" for i, d in enumerate(design_params) if d != k)
+        for col, (data, yv, title) in enumerate([(raw, vals, "CST 原始資料"), (pred, fine_vals, "代理模型預測")]):
+            ax = axes[row, col]
+            im = ax.pcolormesh(freq, yv, data, cmap="viridis_r", vmin=-25, vmax=0, shading="nearest")
+            for lo, hi in bands:
+                ax.axvline(lo, color="w", ls="--", lw=0.8)
+                ax.axvline(hi, color="w", ls="--", lw=0.8)
+            ax.set_ylabel(k)
+            ax.set_title(f"{src}：{title}（{fixed_txt}）", fontsize=9)
+            if row == n - 1:
+                ax.set_xlabel("Frequency (GHz)")
+            fig.colorbar(im, ax=ax, label="S11 (dB)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
 
 
 # ============================================================
@@ -380,9 +526,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default=DATA_DIR, help="CST 匯出檔資料夾路徑")
     ap.add_argument("--band", default="6E", choices=list(WIFI_BANDS), help="目標最佳化頻段")
-    ap.add_argument("--holdout", type=float, nargs="*", default=None,
-                    help="指定第一個設計參數要隱藏驗證的數值（若未指定，自動挑中間 2 組樣本）")
-    ap.add_argument("--epochs", type=int, default=2500, help="訓練 Epochs 數")
+    ap.add_argument("--holdout", nargs="*", default=None,
+                    help="驗證時要隱藏的樣本，寫成 參數=數值（如 W_slot2=12）；未指定則每個掃描檔各藏中間 1 組")
+    ap.add_argument("--exclude", nargs="*", default=None,
+                    help=f"略過的檔名樣式（預設 {EXCLUDE_PATTERNS}）；只寫 --exclude 不帶值 = 全部讀取")
+    ap.add_argument("--epochs", type=int, default=None, help="訓練 Epochs 數（預設依資料量自動決定）")
+    ap.add_argument("--trust-radius", type=float, default=0.15,
+                    help="4 個以上參數時，只搜尋離 CST 樣本正規化距離 ≤ 此值的組合（0.15 ≈ 參數範圍的 15%%）")
     ap.add_argument("--n-ensemble", type=int, default=5, help="集成模型數量 (計算信心區間)")
     ap.add_argument("--skip-validate", action="store_true", help="跳過留一驗證")
     args = ap.parse_args()
@@ -391,9 +541,12 @@ def main():
     bands = WIFI_BANDS[args.band]
 
     print(f"使用運算裝置：{DEVICE}")
-    runs, design_params, fixed = load_all_runs(args.data)
+    runs, design_params, fixed = load_all_runs(args.data, args.exclude)
     freq = runs[0]["freq"]
     print(f"共 {len(runs)} 組模擬，每組 {len(freq)} 個頻點 ({freq[0]:.2f}-{freq[-1]:.2f} GHz)")
+    if args.epochs is None:
+        n_points = sum(len(r["freq"]) for r in runs)
+        print(f"未指定 --epochs，依資料量 ({n_points} 個頻點) 自動設為約 {auto_epochs(n_points)} epochs")
     print(f"自動偵測到的設計變數 (共 {len(design_params)} 個)：{design_params}")
     print(f"固定不變的參數：{fixed}")
 
@@ -404,8 +557,8 @@ def main():
     print()
 
     # ---- 原始模擬資料在目標頻段的表現 ----
-    print(f"=== 原始 CST 資料在 {args.band} 頻段 {bands} 的表現 (前 10 筆) ===")
-    sorted_runs = sorted(runs, key=lambda r: [r["params"][k] for k in design_params])
+    print(f"=== 原始 CST 資料在 {args.band} 頻段 {bands} 表現最好的 10 組 ===")
+    sorted_runs = sorted(runs, key=lambda r: -score(band_metrics(r["freq"], r["s11"], bands)))
     for r in sorted_runs[:10]:
         m = band_metrics(r["freq"], r["s11"], bands)
         p_str = format_params(design_params, [r["params"][k] for k in design_params])
@@ -417,20 +570,18 @@ def main():
 
     # ---- 留一驗證 (支援單參數與多參數 + 繪製信心區間陰影帶) ----
     if not args.skip_validate and len(runs) >= 4:
-        dp0 = design_params[0]
         if args.holdout:
-            held = [r for r in runs if r["params"][dp0] in args.holdout]
-            train = [r for r in runs if r["params"][dp0] not in args.holdout]
+            # 樣本只要符合任一個 參數=數值 就藏起來。注意多參數時像 W_slot1=44 會對到好幾條掃描線上的所有樣本
+            specs = parse_holdout(args.holdout, design_params)
+            held = [r for r in runs if any(abs(r["params"][k] - v) < 1e-9 for k, v in specs)]
         else:
-            # 自動挑選排序後位於 1/3 與 2/3 位置的 2 組資料作為內部驗證集（避免選到邊界外插）
-            idx1 = len(sorted_runs) // 3
-            idx2 = (len(sorted_runs) * 2) // 3
-            held_indices = {idx1, idx2} if idx1 != idx2 else {idx1}
-            held = [sorted_runs[i] for i in sorted(held_indices)]
-            train = [sorted_runs[i] for i in range(len(sorted_runs)) if i not in held_indices]
+            held = default_holdout(runs, design_params)
+        held_ids = {id(r) for r in held}
+        train = [r for r in runs if id(r) not in held_ids]
 
         if held and train:
-            held_desc = [format_params(design_params, [r["params"][k] for k in design_params]) for r in held]
+            held_desc = [f"{r.get('source', '')}: " + format_params(design_params, [r["params"][k] for k in design_params])
+                         for r in held]
             print(f"=== 留一驗證：隱藏 {len(held)} 組樣本 {held_desc}，僅用其餘 {len(train)} 組訓練 ===")
             models_v, norm_v = train_ensemble(train, design_params, bands,
                                               epochs=args.epochs, n_ensemble=args.n_ensemble, verbose=True)
@@ -479,7 +630,11 @@ def main():
     print(f"  最終模型權重已存：{MODEL_PATH}")
 
     # ---- 用代理模型細掃單/多參數設計空間 ----
-    param_grid, grid_axes = generate_search_grid(runs, design_params)
+    sweeps_path = os.path.join(OUT_DIR, "sweeps.png")
+    plot_sweeps(runs, design_params, models, norm, bands, sweeps_path)
+    print(f"  各掃描線 CST vs 代理模型熱圖已存：{sweeps_path}")
+
+    param_grid, grid_axes = generate_search_grid(runs, design_params, trust_radius=args.trust_radius)
     fine_freq = np.linspace(freq[0], freq[-1], len(freq))
     mean_curves, std_curves = predict_curves_batch(models, norm, param_grid, fine_freq)
 
@@ -490,6 +645,8 @@ def main():
     order = np.argsort(-scores)
 
     print(f"=== 代理模型細掃設計空間 {design_params} (共搜尋 {len(param_grid)} 組參數組合) ===")
+    if len(design_params) >= 4:
+        print(f"  (只搜尋離 CST 樣本 {args.trust_radius:.0%} 參數範圍以內的組合；遠離資料的組合模型沒有依據)")
     print(f"目標：{args.band} 頻段 S11 < {S11_GOAL_DB} dB 的均衡覆蓋率最大")
     for rank, i in enumerate(order[:5], 1):
         m = metrics[i]
