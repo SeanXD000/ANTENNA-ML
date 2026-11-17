@@ -479,6 +479,34 @@ def default_holdout(runs, design_params):
     return held
 
 
+def interp_baseline(train, target_params, design_params, freq):
+    """基準模型（不用 AI）：只靠已有的 CST 曲線內插，AI 要贏過它才有意義。
+    1) 目標點落在某條掃描線上（只有一個參數不同、其餘相同），且兩側各有訓練曲線 → 相鄰兩條線性內插
+    2) 否則（例如 4 個參數同時變動的點）→ 參數空間（各參數正規化到 0~1）最近 4 條曲線，距離反比加權平均
+    回傳 (S11 曲線, 使用的方法)。"""
+    keys = design_params
+    tp = np.array([target_params[k] for k in keys], dtype=float)
+    P = np.array([[r["params"][k] for k in keys] for r in train], dtype=float)
+    S = np.array([np.interp(freq, r["freq"], r["s11"]) for r in train])
+
+    for j in range(len(keys)):
+        others = [i for i in range(len(keys)) if i != j]
+        same = np.all(np.abs(P[:, others] - tp[others]) < 1e-9, axis=1)
+        lo = same & (P[:, j] < tp[j])
+        hi = same & (P[:, j] > tp[j])
+        if lo.any() and hi.any():
+            a = np.where(lo)[0][np.argmax(P[lo, j])]
+            b = np.where(hi)[0][np.argmin(P[hi, j])]
+            w = (tp[j] - P[a, j]) / (P[b, j] - P[a, j])
+            return (1 - w) * S[a] + w * S[b], f"掃描線線性內插({keys[j]})"
+
+    span = np.maximum(P.max(axis=0) - P.min(axis=0), 1e-12)
+    d = np.linalg.norm((P - tp) / span, axis=1)
+    idx = np.argsort(d)[:4]
+    w = 1.0 / np.maximum(d[idx], 1e-9) ** 2
+    return (w[:, None] * S[idx]).sum(axis=0) / w.sum(), "最近4條加權平均"
+
+
 def plot_sweeps(runs, design_params, models, norm, bands, out_path):
     """每個來源檔（一條掃描線）畫一列：左 = CST 原始 S11 熱圖，右 = 代理模型在同一條線上的預測。
     兼做資料探索 (EDA)：看共振頻率怎麼隨參數移動。"""
@@ -586,6 +614,7 @@ def main():
             models_v, norm_v = train_ensemble(train, design_params, bands,
                                               epochs=args.epochs, n_ensemble=args.n_ensemble, verbose=True)
 
+            base_rmses, ai_rmses = [], []
             fig, axes = plt.subplots(len(held), 1, figsize=(10, 3.8 * len(held)), squeeze=False)
             for ax, r in zip(axes[:, 0], held):
                 pv = [r["params"][k] for k in design_params]
@@ -594,9 +623,16 @@ def main():
                 mt = band_metrics(r["freq"], r["s11"], bands)
                 mp = band_metrics(r["freq"], pred_mean, bands)
                 p_str = format_params(design_params, pv)
+                base_curve, base_how = interp_baseline(train, r["params"], design_params, r["freq"])
+                base_rmse = np.sqrt(np.mean((base_curve - r["s11"]) ** 2))
+                base_cov = band_metrics(r["freq"], base_curve, bands)["coverage"]
+                base_rmses.append(base_rmse)
+                ai_rmses.append(rmse)
                 print(f"  驗證 [{p_str}]: 全頻 RMSE = {rmse:.2f} dB | {args.band} 覆蓋率 "
                       f"真實 {mt['coverage'] * 100:.1f}% vs 預測 {mp['coverage'] * 100:.1f}% "
                       f"(平均不確定性 ±{np.mean(pred_std):.2f} dB)")
+                print(f"      基準(內插) RMSE = {base_rmse:.2f} dB，覆蓋率 {base_cov * 100:.1f}%  [{base_how}]  "
+                      f"→ AI {'較好' if rmse < base_rmse else '較差'} ({rmse / max(base_rmse, 1e-9):.2f}× 基準)")
 
                 ax.plot(r["freq"], r["s11"], "k-", lw=1.6, label="CST 模擬 (真實)")
                 ax.plot(r["freq"], pred_mean, "r--", lw=1.4, label="AI 集成預測 (平均)")
@@ -611,6 +647,7 @@ def main():
                 ax.legend(loc="lower left")
                 ax.grid(alpha=0.3)
 
+            print(f"  平均 RMSE：AI {np.mean(ai_rmses):.3f} dB vs 基準(內插) {np.mean(base_rmses):.3f} dB")
             fig.tight_layout()
             val_path = os.path.join(OUT_DIR, "validation.png")
             fig.savefig(val_path, dpi=140)
