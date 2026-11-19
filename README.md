@@ -9,6 +9,7 @@
 | `antenna_ml.py` | 主程式：讀 CST 匯出檔 → 集成模型訓練 → 留一驗證 → 細掃設計空間找最佳參數 → 主動學習推薦下一次 CST 模擬點 |
 | `iterative_train.py` | 疊代微調：補跑 CST 後把新檔丟進 `data/`，在既有模型上微調，不用從頭訓練 |
 | `compare_verify.py` | CST 驗證結果 vs 模型預測自動比對：印出覆蓋率、−10 dB 邊界、共振頻率、RMSE、不確定性校準，畫比對圖並追加紀錄到 `outputs/verify_log.csv` |
+| `tolerance.py` | 製程容差分析：以 CST 實測過的設計為名目點做 Monte Carlo，估計尺寸誤差下的良率、單一參數敏感度，輸出 `outputs/tolerance_<檔名>.png` |
 | `cst/` | `make_doe.py --batch N` 產生第 N 批多參數拉丁超立方取樣清單（`doe_batchN.csv`）與對應的 CST macro（第 1 批 `run_doe.bas`、之後 `run_doe_batchN.bas`），macro 自動逐組模擬並匯出到 `data/doe_batchN.txt` |
 | `train.py` | 入門範例：最小的 PyTorch 代理模型（手打假資料），學習用 |
 | `架構與目標.md` | 對照 ML 開發流程，說明每一步選了什麼方法、做到哪裡、下一步 |
@@ -49,7 +50,14 @@ pip install torch numpy matplotlib
    ```
 
    產出：`outputs/compare_<檔名>.png`、追加一列到 `outputs/verify_log.csv`。模型若比驗證檔新（可能已經用它訓練過），程式會警告。
-4. 比對完再重訓（`antenna_ml.py`）或微調：
+4. 製程容差分析（選用）：
+
+   ```bash
+   python tolerance.py data/verify_best3.txt                     # 預設 ±0.05 / 0.1 / 0.2 mm
+   python tolerance.py data/verify_best3.txt --tol 0.1 0.3 --n 5000
+   ```
+
+5. 比對完再重訓（`antenna_ml.py`）或微調：
 
    ```bash
    python iterative_train.py             # 預設 300 epochs、lr 5e-5
@@ -78,7 +86,8 @@ pip install torch numpy matplotlib
 每次 commit 後由 Claude 讀取變更內容整理，新的在最上面。
 
 <!-- CHANGELOG:START -->
-- **2026-11-20** 驗證新分數第 1 名並重訓，加進度條：[36.97, 12.502, 22.944, 13.932] 在 CST 實測（`verify_best3.txt`），重訓前用 `compare_verify.py` 比對：6E 覆蓋率 100%（預測 100%）、**邊界餘裕 1.91 dB**（預測 2.05，verify_best2 只有 0.46）、平均 −17.02 dB、−10 dB 頻寬 5.864–7.856 GHz（邊界誤差 < 0.08 GHz）；模型漏掉 6.04 GHz 的第二個共振谷，帶內 RMSE 2.53 dB，但誤差方向是保守的。**verify_best3 成為目前最佳設計。** 165 組重訓：18 個驗證點平均 AI 1.13 vs baseline 1.61 dB，s = 2.55。新前 5 名預測邊界餘裕 2.0–2.3 dB，只比實測多 0.1–0.4 dB（小於不確定性），設計已收斂。另外 `antenna_ml.py`、`iterative_train.py` 訓練時每 20% 印一行進度條（百分比、經過時間、預估剩餘），輸出導到檔案也逐行寫入。
+- **2026-11-20** 新增 `tolerance.py` 製程容差分析：以 CST 實測設計為名目點，各設計變數加均勻分布 ±tol 誤差做 Monte Carlo；估計 S11 = CST 實測 + [模型(擾動) − 模型(名目)]，抵銷模型在名目點本身的偏差。verify_best3 在 ±0.05 / 0.1 / 0.2 / 0.3 mm 良率全部 100%，±0.3 mm 時帶內最差 S11 的 95 百分位 −11.39 dB（名目 −11.91）。最敏感的是 W_slot2（−1.40 dB/mm）與 Ymax（+0.66 dB/mm），W_slot1 幾乎無影響。±0.5 mm 的最差角落 −9.97 dB 才剛好過線。限制：不含板厚、介電常數；±0.3 mm 內是模型內插，未經 CST 確認。
+- **2026-11-20** `7570ffc` 驗證新分數第 1 名並重訓，加進度條：[36.97, 12.502, 22.944, 13.932] 在 CST 實測（`verify_best3.txt`），重訓前用 `compare_verify.py` 比對：6E 覆蓋率 100%（預測 100%）、**邊界餘裕 1.91 dB**（預測 2.05，verify_best2 只有 0.46）、平均 −17.02 dB、−10 dB 頻寬 5.864–7.856 GHz（邊界誤差 < 0.08 GHz）；模型漏掉 6.04 GHz 的第二個共振谷，帶內 RMSE 2.53 dB，但誤差方向是保守的。**verify_best3 成為目前最佳設計。** 165 組重訓：18 個驗證點平均 AI 1.13 vs baseline 1.61 dB，s = 2.55。新前 5 名預測邊界餘裕 2.0–2.3 dB，只比實測多 0.1–0.4 dB（小於不確定性），設計已收斂。另外 `antenna_ml.py`、`iterative_train.py` 訓練時每 20% 印一行進度條（百分比、經過時間、預估剩餘），輸出導到檔案也逐行寫入。
 - **2026-11-20** `0f61ba4` 檢討綜合分數：舊版 `覆蓋率×100 − 平均 dB` 讓 1 個百分點覆蓋率 = 1 dB 平均深度，深谷可以換掉覆蓋率（97.5% + 平均 −23 dB 贏過 100% + −17 dB）。新版 = `覆蓋率×70 + 最差子頻段覆蓋率×30 + 邊界餘裕 − 0.2 × 封頂平均 dB`：邊界餘裕是帶內最差點比 −10 dB 低多少（0–5 dB），只有 100% 覆蓋才會 > 0，所以永遠不會拿覆蓋率去換；平均 dB 每點最深只算到 −20 dB，只當 tie-breaker。中間試過只用封頂深度當次要項，結果前 5 名全部擠到 DOE 邊界 W_slot1=36.1，所以改用邊界餘裕。新前 5 名全部 6E 100%、邊界餘裕約 2 dB（verify_best2 實測 0.46 dB）、±0.5 dB，不貼邊界；第 1 名 [36.97, 12.502, 22.944, 13.932]。輸出加印邊界餘裕。
 - **2026-11-19** `62c6dbd` 搜尋範圍限制在 DOE 涵蓋區域：新增 `--search-scope`（預設 `doe`），4 個以上參數時只以多參數資料（DOE、verify，共 52 組）為信任區域中心，並限制在它們的參數範圍內（W_slot1 36.1–44.8、W_slot2 10.2–18、W_slot3 18.1–25.8、Ymax 11.1–18.4）；`all` 為舊做法。用現有模型比較：舊範圍第 1、2 名落在 W_slot2 ≈ 7.5（不可信）；新範圍前 5 名全部預測 6E 100%、平均約 −16.4 dB、±0.36–0.92 dB，集中在 verify_best2 同一區。最穩的候選 [40.92, 13.685, 22.615, 13.925]（±0.36 dB）。模型未重訓，`outputs/optimize_6E.png` 要下次跑 `antenna_ml.py` 才會更新。
 - **2026-11-19** `7ae0509` 第 2 批 DOE 與重訓：`cst/make_doe.py` 改為 `--batch N`，各批範圍與亂數種子寫在程式裡（第 1 批重產結果不變），並以 `run_doe.bas` 為範本產生 `run_doe_batch2.bas`。第 2 批 25 組範圍 W_slot1 36–42、W_slot2 10–16、W_slot3 20–26、Ymax 11–17。**重訓前**用 `compare_verify.py` 測舊模型：全頻 RMSE 平均 2.50 dB、15 組覆蓋率誤差超過 5 個百分點；Ymax < 13 的 8 組全部 2.8–5.9 dB、覆蓋率嚴重高估（例如實測 28% vs 預測 97.5%），舊建議點 [38.453, 13.049, 23.121, 12.843] 因此作廢。164 組重訓後：17 個驗證點平均 AI 1.09 vs baseline 1.59 dB，verify_best2 從 2.26 降到 0.97 dB，s = 2.25、β = 0。新第 1 名 [41.921, W_slot2=7.634, 23.075, 12.386] 在 DOE 範圍外、不可信；可信候選為 [39.948, 13.903, 22.391, 13.979]（預測 100%、±0.54 dB）。實測最好仍是 verify_best2（100%），第 2 批最好 #20 [40.6, 12.7, 22.1, 13.8]（97%）。下一步：搜尋限制在 DOE 涵蓋範圍、檢討綜合分數。
