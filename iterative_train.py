@@ -91,6 +91,7 @@ def main():
                     opt.step()
             print(f"  [模型 {i}/{len(models)}] RMSE {before:.3f} dB -> {rmse_db(model, p, f, y, norm):.3f} dB")
 
+    norm.set_train_points(runs, design_params)  # 新補的 CST 點算「已有資料」，距離項才會跟著縮小
     torch.save({"state_dicts": [m.state_dict() for m in models], "norm": norm.state(),
                 "design_params": design_params, "fixed_params": fixed}, MODEL_PATH)
     print(f"--- 模型已更新並存檔至：{MODEL_PATH} ---")

@@ -196,9 +196,14 @@ class AntennaSurrogate(nn.Module):
 class Normalizer:
     """把參數與頻率縮到 [0,1]，S11 標準化（含 +1e-8 防除零保護）。"""
 
-    def __init__(self, p_min, p_max, f_min, f_max, y_mean, y_std, sigma_scale=1.0):
-        # sigma_scale：不確定性校正係數（驗證集「實際誤差 / 集成標準差」），預測時把集成標準差乘上它
+    def __init__(self, p_min, p_max, f_min, f_max, y_mean, y_std,
+                 sigma_scale=1.0, dist_coef=0.0, train_p=None):
+        # 不確定性校正（見 calibrate_uncertainty）：預測時
+        #   σ = sqrt((sigma_scale × 集成標準差)² + (dist_coef × d)²)
+        # d = 離最近一筆訓練樣本的距離（參數正規化到 [0,1] 後的歐氏距離），train_p 存訓練樣本的正規化參數
         self.sigma_scale = float(sigma_scale)
+        self.dist_coef = float(dist_coef)
+        self.train_p = None if train_p is None else np.asarray(train_p, float)
         self.p_min = np.asarray(p_min, float)
         self.p_max = np.asarray(p_max, float)
         self.f_min = float(f_min)
@@ -216,7 +221,19 @@ class Normalizer:
 
     def state(self):
         return dict(p_min=self.p_min.tolist(), p_max=self.p_max.tolist(), f_min=self.f_min,
-                    f_max=self.f_max, y_mean=self.y_mean, y_std=self.y_std, sigma_scale=self.sigma_scale)
+                    f_max=self.f_max, y_mean=self.y_mean, y_std=self.y_std, sigma_scale=self.sigma_scale,
+                    dist_coef=self.dist_coef,
+                    train_p=None if self.train_p is None else self.train_p.tolist())
+
+    def set_train_points(self, runs, design_params):
+        self.train_p = self.p([[r["params"][k] for k in design_params] for r in runs])
+
+    def nn_distance(self, params):
+        """每組參數離最近一筆訓練樣本的正規化距離；沒有訓練樣本紀錄（舊模型檔）時回傳 0。"""
+        q = self.p(np.atleast_2d(params))
+        if self.train_p is None or len(self.train_p) == 0:
+            return np.zeros(len(q))
+        return np.min(np.linalg.norm(q[:, None, :] - self.train_p[None, :, :], axis=2), axis=1)
 
 
 def runs_to_arrays(runs, design_params):
@@ -261,6 +278,7 @@ def train_ensemble(runs, design_params, bands, epochs=None, n_ensemble=5, verbos
     if epochs is None:
         epochs = auto_epochs(len(Y))
     norm = Normalizer(P.min(0), P.max(0), F.min(), F.max(), Y.mean(), Y.std())
+    norm.set_train_points(runs, design_params)
     weights = compute_sample_weights(F, Y, bands)
 
     p_t = torch.tensor(norm.p(P), dtype=torch.float32, device=DEVICE)
@@ -334,7 +352,10 @@ def predict_curves_batch(models, norm, param_grid, freq):
         preds_all.append(preds.reshape(M, K))
 
     preds_stack = np.stack(preds_all, axis=0)  # (n_ensemble, M, K)
-    return np.mean(preds_stack, axis=0), np.std(preds_stack, axis=0) * norm.sigma_scale
+    std = np.std(preds_stack, axis=0) * norm.sigma_scale
+    if norm.dist_coef > 0:
+        std = np.sqrt(std ** 2 + (norm.dist_coef * norm.nn_distance(param_grid))[:, None] ** 2)
+    return np.mean(preds_stack, axis=0), std
 
 
 def predict_single(models, norm, param_values, freq):
@@ -457,21 +478,28 @@ def group_by_source(runs):
     return groups
 
 
-def calibrate_sigma(models, norm, held, design_params, max_scale=10.0):
-    """用驗證樣本校正集成標準差：scale = 實際誤差均方根 / 集成標準差均方根（合併所有驗證頻點）。
-    集成成員只差在亂數種子，彼此太像，標準差通常偏小。只放大不縮小（scale >= 1），避免低估風險。
-    回傳 (scale, 校正前的各樣本 [(RMSE, 平均σ)])。注意：驗證樣本少時這只是粗略估計。"""
-    sq_err, sq_sig, per = [], [], []
+def calibrate_uncertainty(models, norm, held, design_params):
+    """用驗證樣本校正不確定性，模型：σ² = (s × 集成標準差)² + (β × d)²
+    - s：集成成員只差在亂數種子，彼此太像，標準差通常偏小 → 整體放大（限 1–10，只放大不縮小）
+    - β：離訓練樣本越遠（外推）誤差越大，但集成標準差反應不出來 → 依距離 d 額外加寬（dB / 單位正規化距離）
+    以各驗證樣本的 (均方誤差, 平均集成變異數, d) 做高斯負對數概似的網格搜尋。
+    norm 必須是校正前（sigma_scale=1、dist_coef=0）。回傳 (s, β, 各樣本 [(d, RMSE, 集成σ)])。
+    驗證樣本少、或都貼著訓練資料時，β 估不準，只是粗略值。"""
+    rows = []
     for r in held:
         pv = [r["params"][k] for k in design_params]
         mean, std = predict_single(models, norm, pv, r["freq"])
-        sq_err.append((mean - r["s11"]) ** 2)
-        sq_sig.append(std ** 2)
-        per.append((float(np.sqrt(np.mean(sq_err[-1]))), float(np.mean(std))))
-    rms_err = np.sqrt(np.mean(np.concatenate(sq_err)))
-    rms_sig = np.sqrt(np.mean(np.concatenate(sq_sig)))
-    scale = rms_err / rms_sig if rms_sig > 1e-9 else 1.0
-    return float(np.clip(scale, 1.0, max_scale)), per
+        rows.append((float(norm.nn_distance(pv)[0]), float(np.mean((mean - r["s11"]) ** 2)),
+                     float(np.mean(std ** 2))))
+    d, e2, v = (np.array(x) for x in zip(*rows))
+    s_grid = np.linspace(1.0, 10.0, 181)
+    b_grid = np.linspace(0.0, 30.0, 301)
+    S, B = np.meshgrid(s_grid, b_grid, indexing="ij")
+    var = S[..., None] ** 2 * v + B[..., None] ** 2 * d ** 2 + 1e-12
+    nll = np.sum(np.log(var) + e2 / var, axis=-1)
+    i, j = np.unravel_index(np.argmin(nll), nll.shape)
+    return float(s_grid[i]), float(b_grid[j]), [(di, float(np.sqrt(ei)), float(np.sqrt(vi)))
+                                                  for di, ei, vi in rows]
 
 
 def swept_param(rs, design_params):
@@ -480,8 +508,11 @@ def swept_param(rs, design_params):
     return varying[0] if varying else design_params[0]
 
 
-def default_holdout(runs, design_params):
-    """自動挑驗證樣本：每個來源檔（每條掃描線）各藏 1 組位於中間的樣本，避免選到邊界外插。
+def default_holdout(runs, design_params, n_multi=5):
+    """自動挑驗證樣本：
+    - 單參數掃描檔：各藏 1 組位於中間的樣本，避免選到邊界外插
+    - 多參數取樣檔（DOE，有 2 個以上參數在變）：依第一個參數排序後平均挑 n_multi 組
+    - 少於 3 組的檔（verify_best* 這類單點驗證）：整檔藏起來，用來測外推（校正距離項 β 需要它們）
     只有一個來源檔時，沿用舊做法：排序後 1/3 與 2/3 位置各藏 1 組。"""
     groups = group_by_source(runs)
     key = lambda r: [r["params"][k] for k in design_params]
@@ -491,9 +522,16 @@ def default_holdout(runs, design_params):
     held = []
     for src in sorted(groups):
         rs = groups[src]
+        if len(rs) < 3:
+            held.extend(rs)
+            continue
         k = swept_param(rs, design_params)
         rs = sorted(rs, key=lambda r: r["params"][k])
-        if len(rs) >= 3:
+        varying = [p for p in design_params if len({r["params"][p] for r in rs}) > 1]
+        if len(varying) > 1 and len(rs) >= 4 * n_multi:
+            idx = np.linspace(0, len(rs) - 1, n_multi + 2)[1:-1].round().astype(int)
+            held.extend(rs[i] for i in idx)
+        else:
             held.append(rs[len(rs) // 2])
     return held
 
@@ -616,7 +654,7 @@ def main():
     print()
 
     # ---- 留一驗證 (支援單參數與多參數 + 繪製信心區間陰影帶) ----
-    sigma_scale = 1.0  # 沒做驗證就不校正
+    sigma_scale, dist_coef = 1.0, 0.0  # 沒做驗證就不校正
     if not args.skip_validate and len(runs) >= 4:
         if args.holdout:
             # 樣本只要符合任一個 參數=數值 就藏起來。注意多參數時像 W_slot1=44 會對到好幾條掃描線上的所有樣本
@@ -634,11 +672,16 @@ def main():
             models_v, norm_v = train_ensemble(train, design_params, bands,
                                               epochs=args.epochs, n_ensemble=args.n_ensemble, verbose=True)
 
-            # 不確定性校正：集成標準差通常偏小，用驗證樣本算出放大係數，之後驗證圖與最終模型都套用
-            sigma_scale, _ = calibrate_sigma(models_v, norm_v, held, design_params)
-            norm_v.sigma_scale = sigma_scale
-            print(f"  不確定性校正係數 = {sigma_scale:.2f}（集成標準差 × {sigma_scale:.2f}，"
-                  f"依 {len(held)} 個驗證樣本估計）")
+            # 不確定性校正：σ² = (s × 集成標準差)² + (β × 離訓練樣本距離)²，之後驗證圖與最終模型都套用
+            sigma_scale, dist_coef, cal_rows = calibrate_uncertainty(models_v, norm_v, held, design_params)
+            norm_v.sigma_scale, norm_v.dist_coef = sigma_scale, dist_coef
+            print(f"  不確定性校正（依 {len(held)} 個驗證樣本）：集成標準差 × {sigma_scale:.2f}，"
+                  f"距離項 β = {dist_coef:.1f} dB / 單位正規化距離")
+            print(f"    {'樣本':<48}{'距離 d':>8}{'實際 RMSE':>11}{'集成 σ':>9}{'校正後 σ':>10}")
+            for r, (d_i, rmse_i, sig_i) in zip(held, cal_rows):
+                cal_i = np.sqrt((sigma_scale * sig_i) ** 2 + (dist_coef * d_i) ** 2)
+                p_str = format_params(design_params, [r["params"][k] for k in design_params])
+                print(f"    {p_str:<48}{d_i:>8.3f}{rmse_i:>11.2f}{sig_i:>9.2f}{cal_i:>10.2f}")
 
             base_rmses, ai_rmses = [], []
             fig, axes = plt.subplots(len(held), 1, figsize=(10, 3.8 * len(held)), squeeze=False)
@@ -684,7 +727,7 @@ def main():
     print(f"=== 使用全部 {len(runs)} 組資料訓練最終代理模型 (Ensemble={args.n_ensemble}) ===")
     models, norm = train_ensemble(runs, design_params, bands,
                                   epochs=args.epochs, n_ensemble=args.n_ensemble, verbose=True)
-    norm.sigma_scale = sigma_scale
+    norm.sigma_scale, norm.dist_coef = sigma_scale, dist_coef
     torch.save({
         "state_dicts": [m.state_dict() for m in models],
         "norm": norm.state(),
