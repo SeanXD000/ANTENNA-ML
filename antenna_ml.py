@@ -366,9 +366,14 @@ def predict_single(models, norm, param_values, freq):
 # ============================================================
 # 3. 多頻段平衡評分與主動學習指標
 # ============================================================
+MARGIN_CAP_DB = 5.0   # 邊界餘裕最多算 5 dB
+DEPTH_CAP_DB = -20.0  # 深度封頂：比 -20 dB 更深不再加分（深谷對設計沒幫助，模型也常預測過頭）
+DEPTH_WEIGHT = 0.2    # 深度只當最後的 tie-breaker
+
+
 def band_metrics(freq, s11, bands):
     """針對每個子頻段獨立計算覆蓋率與平均 S11，避免寬頻段(6E)稀釋窄頻段(2.4G)。"""
-    sub_covs, sub_means, sub_worsts, sub_bests = [], [], [], []
+    sub_covs, sub_means, sub_worsts, sub_bests, sub_margins, sub_capped = [], [], [], [], [], []
     for lo, hi in bands:
         mask = (freq >= lo) & (freq <= hi)
         s = s11[mask]
@@ -378,6 +383,8 @@ def band_metrics(freq, s11, bands):
         sub_means.append(float(np.mean(s)))
         sub_worsts.append(float(np.max(s)))
         sub_bests.append(float(np.min(s)))
+        sub_margins.append(float(np.clip(S11_GOAL_DB - np.max(s), 0.0, MARGIN_CAP_DB)))
+        sub_capped.append(float(np.mean(np.maximum(s, DEPTH_CAP_DB))))
 
     return dict(
         coverage=float(np.mean(sub_covs)),      # 各子頻段覆蓋率的平均（權重相等）
@@ -386,12 +393,21 @@ def band_metrics(freq, s11, bands):
         mean_db=float(np.mean(sub_means)),
         worst_db=float(np.max(sub_worsts)),
         best_db=float(np.min(sub_bests)),
+        margin_db=float(np.mean(sub_margins)),     # 邊界餘裕：帶內最差點比 -10 dB 低多少（0~5 dB）
+        capped_mean_db=float(np.mean(sub_capped)),  # 平均 S11，但每點最深只算到 -20 dB
     )
 
 
 def score(m):
-    """綜合評分：優先要求各子頻段均衡覆蓋，其次看平均覆蓋率與深度。"""
-    return m["coverage"] * 70.0 + m["min_coverage"] * 30.0 - m["mean_db"]
+    """綜合評分（越高越好），三項依重要性排列：
+    1. 覆蓋率（0~100 分）：各子頻段平均覆蓋率 ×70% + 最差子頻段覆蓋率 ×30%
+    2. 邊界餘裕（0~5 分）：帶內最差點比 -10 dB 低多少 dB。只有覆蓋率 100% 的子頻段才可能 > 0，
+       所以永遠不會拿覆蓋率去換；用來在多個 100% 設計中挑最不怕製程誤差的
+    3. 深度（約 2~4 分）：封頂在 -20 dB 的平均 S11 × 0.2，只當最後的 tie-breaker
+    舊版 `覆蓋率×100 − 平均 dB` 中，1 個百分點覆蓋率 = 1 dB 平均深度，深谷可以換掉覆蓋率
+    （97.5% + 平均 −23 dB 贏過 100% + −17 dB）。"""
+    return (m["coverage"] * 70.0 + m["min_coverage"] * 30.0
+            + m["margin_db"] - DEPTH_WEIGHT * m["capped_mean_db"])
 
 
 def resonances(freq, s11, thr=S11_GOAL_DB):
@@ -670,7 +686,7 @@ def main():
         m = band_metrics(r["freq"], r["s11"], bands)
         p_str = format_params(design_params, [r["params"][k] for k in design_params])
         print(f"  [{p_str}]  均衡覆蓋率={m['coverage'] * 100:5.1f}% (最低子頻段={m['min_coverage'] * 100:4.1f}%)  "
-              f"平均={m['mean_db']:6.2f} dB  最低={m['best_db']:6.2f} dB")
+              f"邊界餘裕={m['margin_db']:4.2f} dB  平均={m['mean_db']:6.2f} dB  最低={m['best_db']:6.2f} dB")
     if len(sorted_runs) > 10:
         print(f"  ... (其餘 {len(sorted_runs) - 10} 組省略)")
     print()
@@ -789,7 +805,8 @@ def main():
         m = metrics[i]
         p_str = format_params(design_params, param_grid[i])
         print(f"  第{rank}名 [{p_str}]  均衡覆蓋率={m['coverage'] * 100:5.1f}%  "
-              f"平均={m['mean_db']:6.2f} dB  最低={m['best_db']:6.2f} dB  (不確定性 ±{uncertainties[i]:.2f} dB)")
+              f"邊界餘裕={m['margin_db']:4.2f} dB  平均={m['mean_db']:6.2f} dB  最低={m['best_db']:6.2f} dB  "
+              f"(不確定性 ±{uncertainties[i]:.2f} dB)")
 
     best_idx = order[0]
     best_params = param_grid[best_idx]
