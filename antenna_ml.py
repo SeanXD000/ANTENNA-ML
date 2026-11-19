@@ -196,7 +196,9 @@ class AntennaSurrogate(nn.Module):
 class Normalizer:
     """把參數與頻率縮到 [0,1]，S11 標準化（含 +1e-8 防除零保護）。"""
 
-    def __init__(self, p_min, p_max, f_min, f_max, y_mean, y_std):
+    def __init__(self, p_min, p_max, f_min, f_max, y_mean, y_std, sigma_scale=1.0):
+        # sigma_scale：不確定性校正係數（驗證集「實際誤差 / 集成標準差」），預測時把集成標準差乘上它
+        self.sigma_scale = float(sigma_scale)
         self.p_min = np.asarray(p_min, float)
         self.p_max = np.asarray(p_max, float)
         self.f_min = float(f_min)
@@ -214,7 +216,7 @@ class Normalizer:
 
     def state(self):
         return dict(p_min=self.p_min.tolist(), p_max=self.p_max.tolist(), f_min=self.f_min,
-                    f_max=self.f_max, y_mean=self.y_mean, y_std=self.y_std)
+                    f_max=self.f_max, y_mean=self.y_mean, y_std=self.y_std, sigma_scale=self.sigma_scale)
 
 
 def runs_to_arrays(runs, design_params):
@@ -332,7 +334,7 @@ def predict_curves_batch(models, norm, param_grid, freq):
         preds_all.append(preds.reshape(M, K))
 
     preds_stack = np.stack(preds_all, axis=0)  # (n_ensemble, M, K)
-    return np.mean(preds_stack, axis=0), np.std(preds_stack, axis=0)
+    return np.mean(preds_stack, axis=0), np.std(preds_stack, axis=0) * norm.sigma_scale
 
 
 def predict_single(models, norm, param_values, freq):
@@ -453,6 +455,23 @@ def group_by_source(runs):
     for r in runs:
         groups.setdefault(r.get("source", ""), []).append(r)
     return groups
+
+
+def calibrate_sigma(models, norm, held, design_params, max_scale=10.0):
+    """用驗證樣本校正集成標準差：scale = 實際誤差均方根 / 集成標準差均方根（合併所有驗證頻點）。
+    集成成員只差在亂數種子，彼此太像，標準差通常偏小。只放大不縮小（scale >= 1），避免低估風險。
+    回傳 (scale, 校正前的各樣本 [(RMSE, 平均σ)])。注意：驗證樣本少時這只是粗略估計。"""
+    sq_err, sq_sig, per = [], [], []
+    for r in held:
+        pv = [r["params"][k] for k in design_params]
+        mean, std = predict_single(models, norm, pv, r["freq"])
+        sq_err.append((mean - r["s11"]) ** 2)
+        sq_sig.append(std ** 2)
+        per.append((float(np.sqrt(np.mean(sq_err[-1]))), float(np.mean(std))))
+    rms_err = np.sqrt(np.mean(np.concatenate(sq_err)))
+    rms_sig = np.sqrt(np.mean(np.concatenate(sq_sig)))
+    scale = rms_err / rms_sig if rms_sig > 1e-9 else 1.0
+    return float(np.clip(scale, 1.0, max_scale)), per
 
 
 def swept_param(rs, design_params):
@@ -597,6 +616,7 @@ def main():
     print()
 
     # ---- 留一驗證 (支援單參數與多參數 + 繪製信心區間陰影帶) ----
+    sigma_scale = 1.0  # 沒做驗證就不校正
     if not args.skip_validate and len(runs) >= 4:
         if args.holdout:
             # 樣本只要符合任一個 參數=數值 就藏起來。注意多參數時像 W_slot1=44 會對到好幾條掃描線上的所有樣本
@@ -613,6 +633,12 @@ def main():
             print(f"=== 留一驗證：隱藏 {len(held)} 組樣本 {held_desc}，僅用其餘 {len(train)} 組訓練 ===")
             models_v, norm_v = train_ensemble(train, design_params, bands,
                                               epochs=args.epochs, n_ensemble=args.n_ensemble, verbose=True)
+
+            # 不確定性校正：集成標準差通常偏小，用驗證樣本算出放大係數，之後驗證圖與最終模型都套用
+            sigma_scale, _ = calibrate_sigma(models_v, norm_v, held, design_params)
+            norm_v.sigma_scale = sigma_scale
+            print(f"  不確定性校正係數 = {sigma_scale:.2f}（集成標準差 × {sigma_scale:.2f}，"
+                  f"依 {len(held)} 個驗證樣本估計）")
 
             base_rmses, ai_rmses = [], []
             fig, axes = plt.subplots(len(held), 1, figsize=(10, 3.8 * len(held)), squeeze=False)
@@ -658,6 +684,7 @@ def main():
     print(f"=== 使用全部 {len(runs)} 組資料訓練最終代理模型 (Ensemble={args.n_ensemble}) ===")
     models, norm = train_ensemble(runs, design_params, bands,
                                   epochs=args.epochs, n_ensemble=args.n_ensemble, verbose=True)
+    norm.sigma_scale = sigma_scale
     torch.save({
         "state_dicts": [m.state_dict() for m in models],
         "norm": norm.state(),

@@ -8,6 +8,8 @@
 |---|---|
 | `antenna_ml.py` | 主程式：讀 CST 匯出檔 → 集成模型訓練 → 留一驗證 → 細掃設計空間找最佳參數 → 主動學習推薦下一次 CST 模擬點 |
 | `iterative_train.py` | 疊代微調：補跑 CST 後把新檔丟進 `data/`，在既有模型上微調，不用從頭訓練 |
+| `compare_verify.py` | CST 驗證結果 vs 模型預測自動比對：印出覆蓋率、−10 dB 邊界、共振頻率、RMSE、不確定性校準，畫比對圖並追加紀錄到 `outputs/verify_log.csv` |
+| `cst/` | `make_doe.py` 產生多參數拉丁超立方取樣清單、`run_doe.bas` 是 CST macro，自動逐組模擬並匯出 |
 | `train.py` | 入門範例：最小的 PyTorch 代理模型（手打假資料），學習用 |
 | `架構與目標.md` | 對照 ML 開發流程，說明每一步選了什麼方法、做到哪裡、下一步 |
 
@@ -20,7 +22,7 @@ pip install torch numpy matplotlib
 ## 使用
 
 1. 把 CST 參數掃描匯出的 `.txt` / `.dat` 放進 `data/`（格式：每組模擬以 `#Parameters = {...}` 開頭，接著是「頻率 GHz、S11 dB」兩欄）。
-   - 目前的資料是槽孔天線的 4 個單參數掃描：`Wslot1`、`Wslot2`、`Wslot3`、`Ymax`（設計變數 `W_slot1`、`W_slot2`、`W_slot3`、`Ymax`，2–8 GHz）。
+   - 目前的資料是槽孔天線（設計變數 `W_slot1`、`W_slot2`、`W_slot3`、`Ymax`，2–8 GHz）：4 個單參數掃描、`Ymax(12.5_18)` 補掃、4 參數 DOE 25 組（`doe_batch1`）、建議最佳點的 CST 驗證（`verify_best*`），共 139 組。
    - 舊天線的 `W4(0_13).txt` 參數名稱不同，預設會被略過（`--exclude`，預設 `W4*`）。若混入參數名稱不一致的檔案，程式會停下來並列出是哪些檔案。
 2. 訓練 + 最佳化：
 
@@ -33,8 +35,17 @@ pip install torch numpy matplotlib
    ```
 
    產出：`antenna_surrogate.pth`（模型）、`outputs/validation.png`、`outputs/sweeps.png`（每條掃描線的 CST vs 模型熱圖）、`outputs/optimize_<band>.png`。
-   未指定 `--epochs` 時會依資料量自動決定（每個模型約 1 萬次更新）；目前約 10 萬個頻點，對應 400 epochs。
-3. 補跑 CST 後微調：
+   未指定 `--epochs` 時會依資料量自動決定（每個模型約 1 萬次更新）；目前約 14 萬個頻點，對應 400 epochs。
+   信心區間（±σ）已乘上留一驗證算出的不確定性校正係數（存在模型檔裡，目前 1.84）；用 `--skip-validate` 時不校正（係數 1.0）。
+3. 把建議點拿去 CST 模擬，匯出成 `data/verify_bestN.txt`，**在重訓之前**先比對：
+
+   ```bash
+   python compare_verify.py data/verify_best3.txt --note "說明"
+   python compare_verify.py data/verify_best3.txt --no-log       # 只看結果，不寫紀錄
+   ```
+
+   產出：`outputs/compare_<檔名>.png`、追加一列到 `outputs/verify_log.csv`。模型若比驗證檔新（可能已經用它訓練過），程式會警告。
+4. 比對完再重訓（`antenna_ml.py`）或微調：
 
    ```bash
    python iterative_train.py             # 預設 300 epochs、lr 5e-5
@@ -63,6 +74,8 @@ pip install torch numpy matplotlib
 每次 commit 後由 Claude 讀取變更內容整理，新的在最上面。
 
 <!-- CHANGELOG:START -->
+- **2026-11-19** 不確定性校正：集成標準差乘上校正係數 `sigma_scale`，在留一驗證時用「驗證樣本實際誤差均方根 ÷ 集成標準差均方根」估計（限 1–10 倍），存進模型檔，所有預測自動套用（舊模型檔讀入時視為 1.0）。重訓後係數 **1.84**，預測與建議點不變，最佳點不確定性 ±0.69 → ±1.26 dB。限制：只乘一個整體倍數，外推區域仍低估（verify_best2 實際差 7.5 倍）；下一步改為依離 CST 樣本的距離放大不確定性。README 補上 `compare_verify.py` 與驗證流程。
+- **2026-11-19** `17bd3c1` 新增 `compare_verify.py`：讀 CST 驗證檔，自動比對模型預測的覆蓋率、平均 S11、−10 dB 邊界、共振頻率、全頻／帶內 RMSE 與不確定性校準，輸出比對圖並追加到 `outputs/verify_log.csv`。模型比驗證檔新時會警告（實測 verify_best2 重訓後 RMSE 只剩 0.13 dB，原本是 2.26 dB，所以必須在重訓前比對）。
 - **2026-11-18** 驗證第一個建議最佳點並重新訓練：把 [W_slot1=38.92, W_slot2=12.9, W_slot3=23.196, Ymax=14.725] 在 CST 實測（`verify_best2.txt`，資料不進 git）。6E 覆蓋率 **100%**（與預測一致），平均 −16.01 dB（預測 −16.58），−10 dB 區段 5.786–7.724 GHz；深谷預測過頭（−56 vs −38 dB），全頻 RMSE 2.26 dB 但模型自報只有 ±0.30 dB，信心區間偏窄。納入訓練後共 139 組重訓：驗證平均 RMSE AI 0.224 dB vs 內插 baseline 0.518 dB，DOE 點 0.34 dB。新建議點 [38.453, 13.049, 23.121, 12.843] 預測平均 −18.68 dB、頻寬 5.702–7.766 GHz，尚未驗證。`架構與目標.md` 同步更新，下一步以校正不確定性為主。
 - **2026-11-18** `8fb186e` 驗證時加入內插 baseline 比較：驗證點在掃描線上用相鄰兩條曲線線性內插，沒有掃描線可用（DOE 點）則取最近 4 條曲線加權平均；每個驗證點印出 AI 與基準的 RMSE，並印平均。六組驗證點 AI 都優於基準，DOE 點 0.32 dB 對 0.68 dB；Ymax 兩點差距很小。同步更新 `架構與目標.md`：資料增為 138 條、baseline 標為完成，下一步改為驗證建議最佳點、定義門檻、多藏 DOE 驗證點。
 - **2026-11-18** `5442b25` 新增 4 參數聯合取樣：`cst/make_doe.py` 以拉丁超立方在目前最佳點附近產生 25 組（`cst/doe_batch1.csv`），`cst/run_doe.bas` 是 CST macro，自動逐組模擬並匯出到 `data/doe_batch1.txt`。加入訓練後共 138 組；4 個參數同時變動的驗證點 RMSE 0.32 dB、6E 覆蓋率預測與真實一致（76.5%）。新建議最佳點 [W_slot1=38.92, W_slot2=12.9, W_slot3=23.196, Ymax=14.725] 預測 6E 覆蓋率 100%、不確定性 ±0.30 dB，但 W_slot1 落在取樣範圍（40–45）之外，需回 CST 驗證。
