@@ -40,6 +40,7 @@ import itertools
 import os
 import re
 import sys
+import time
 
 import matplotlib
 matplotlib.use("Agg")
@@ -271,6 +272,19 @@ def auto_epochs(n_points, bs=4096, target_steps=TARGET_STEPS):
     return int(min(2500, max(200, round(target_steps / steps_per_epoch))))
 
 
+def fmt_time(sec):
+    sec = int(round(sec))
+    return f"{sec // 3600}:{sec // 60 % 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
+
+
+def print_progress(done, total, elapsed, label, width=20):
+    """印一行進度條：[██████░░░░] 30%  模型 2/5，epoch 80/400  經過 3:12  預估剩 7:28"""
+    frac = done / total
+    bar = "█" * int(round(frac * width)) + "░" * (width - int(round(frac * width)))
+    eta = elapsed / done * (total - done) if done else 0.0
+    print(f"    [{bar}] {frac:4.0%}  {label}  經過 {fmt_time(elapsed)}  預估剩 {fmt_time(eta)}", flush=True)
+
+
 def train_ensemble(runs, design_params, bands, epochs=None, n_ensemble=5, verbose=True):
     """訓練多個代理模型組成 Ensemble，用於預測平均值與不確定性（標準差）。
     epochs=None 時依資料量自動決定（見 auto_epochs）。"""
@@ -288,6 +302,8 @@ def train_ensemble(runs, design_params, bands, epochs=None, n_ensemble=5, verbos
 
     models = []
     n, bs = len(y_t), min(4096, len(y_t))
+    t0, total = time.time(), n_ensemble * epochs
+    report_every = max(1, epochs // 5)  # 每個模型回報 5 次（每 20%）
 
     for m_idx in range(n_ensemble):
         seed = 42 + m_idx * 100
@@ -310,6 +326,9 @@ def train_ensemble(runs, design_params, bands, epochs=None, n_ensemble=5, verbos
                 loss.backward()
                 opt.step()
             sched.step()
+            if verbose and ((ep + 1) % report_every == 0 or ep + 1 == epochs):
+                print_progress(m_idx * epochs + ep + 1, total, time.time() - t0,
+                               f"模型 {m_idx + 1}/{n_ensemble}，epoch {ep + 1}/{epochs}")
 
         model.eval()
         with torch.no_grad():
@@ -639,7 +658,8 @@ def plot_sweeps(runs, design_params, models, norm, bands, out_path):
 # ============================================================
 def main():
     try:
-        sys.stdout.reconfigure(errors="replace")
+        # line_buffering：輸出導到檔案時也逐行寫入，才看得到即時進度
+        sys.stdout.reconfigure(errors="replace", line_buffering=True)
     except Exception:
         pass
 

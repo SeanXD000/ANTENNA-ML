@@ -18,12 +18,14 @@
 """
 import argparse
 import os
+import sys
+import time
 
 import numpy as np
 import torch
 
 from antenna_ml import (DATA_DIR, DEVICE, MODEL_PATH, WIFI_BANDS, AntennaSurrogate, Normalizer,
-                        compute_sample_weights, load_all_runs, runs_to_arrays, train_ensemble)
+                        compute_sample_weights, load_all_runs, print_progress, runs_to_arrays, train_ensemble)
 
 
 def load_checkpoint(path):
@@ -52,6 +54,10 @@ def rmse_db(model, p, f, y, norm):
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(errors="replace", line_buffering=True)  # 輸出導到檔案時也逐行寫入
+    except Exception:
+        pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default=DATA_DIR)
     ap.add_argument("--exclude", nargs="*", default=None,
@@ -77,11 +83,12 @@ def main():
 
         p, f, y, w = to_tensors(runs, design_params, norm, bands)
         n, bs = len(y), min(4096, len(y))
+        t0, total, every = time.time(), len(models) * args.epochs, max(1, args.epochs // 5)
         for i, model in enumerate(models, 1):
             before = rmse_db(model, p, f, y, norm)
             model.train()
             opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-            for _ in range(args.epochs):
+            for ep in range(args.epochs):
                 perm = torch.randperm(n, device=DEVICE)
                 for j in range(0, n, bs):
                     idx = perm[j:j + bs]
@@ -89,6 +96,9 @@ def main():
                     opt.zero_grad()
                     loss.backward()
                     opt.step()
+                if (ep + 1) % every == 0 or ep + 1 == args.epochs:
+                    print_progress((i - 1) * args.epochs + ep + 1, total, time.time() - t0,
+                                   f"模型 {i}/{len(models)}，epoch {ep + 1}/{args.epochs}")
             print(f"  [模型 {i}/{len(models)}] RMSE {before:.3f} dB -> {rmse_db(model, p, f, y, norm):.3f} dB")
 
     norm.set_train_points(runs, design_params)  # 新補的 CST 點算「已有資料」，距離項才會跟著縮小
