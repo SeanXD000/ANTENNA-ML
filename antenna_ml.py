@@ -415,10 +415,24 @@ def format_params(design_params, values):
     return ", ".join(f"{k}={v:g}" for k, v in zip(design_params, values))
 
 
-def generate_search_grid(runs, design_params, max_total_points=5000, trust_radius=0.15):
+def multi_param_runs(runs, design_params):
+    """多參數資料：有 2 個以上參數同時在變的來源檔（DOE），以及少於 3 條的單點驗證檔（verify_best*）。
+    單參數掃描線不算：它們只在一條線上，其他參數固定在離最佳區很遠的值。"""
+    out = []
+    for rs in group_by_source(runs).values():
+        varying = [k for k in design_params if len({r["params"][k] for r in rs}) > 1]
+        if len(rs) < 3 or len(varying) > 1:
+            out.extend(rs)
+    return out
+
+
+def generate_search_grid(runs, design_params, max_total_points=5000, trust_radius=0.15, scope="doe"):
     """自動根據參數數量建立搜尋網格（支援 1D 細掃、2D/3D 網格、高維度局部取樣）。
     4 個參數以上：只在「已模擬過的點附近」取樣（正規化到 [0,1] 後，距離 ≤ trust_radius），
-    因為一次掃一個參數的資料只覆蓋幾條線，離線太遠的組合模型是在瞎猜。"""
+    因為一次掃一個參數的資料只覆蓋幾條線，離線太遠的組合模型是在瞎猜。
+    scope="doe"（預設）：只以多參數資料（DOE、verify）為中心，並限制在它們的參數範圍內。
+    DOE 第 2 批證實：模型沿單參數掃描線外推到沒有多參數資料的區域時會嚴重高估。
+    scope="all"：舊做法，以所有 CST 樣本為中心、範圍為全部資料。"""
     n_p = len(design_params)
     bounds = []
     for k in design_params:
@@ -440,8 +454,13 @@ def generate_search_grid(runs, design_params, max_total_points=5000, trust_radiu
         rng = np.random.default_rng(42)
         lo = np.array([b[0] for b in bounds])
         hi = np.array([b[1] for b in bounds])
-        span = np.where(hi - lo > 1e-8, hi - lo, 1.0)
-        centers = np.array([[r["params"][k] for k in design_params] for r in runs], dtype=float)
+        span = np.where(hi - lo > 1e-8, hi - lo, 1.0)  # 半徑仍以全部資料的範圍換算，和 trust_radius 的定義一致
+        center_runs = runs
+        if scope == "doe":
+            center_runs = multi_param_runs(runs, design_params) or runs
+        centers = np.array([[r["params"][k] for k in design_params] for r in center_runs], dtype=float)
+        if scope == "doe":
+            lo, hi = centers.min(axis=0), centers.max(axis=0)
         n_rand = max(0, max_total_points - len(centers))
         picks = centers[rng.integers(0, len(centers), size=n_rand)]
         # 在正規化空間的球內均勻取樣（半徑 trust_radius）：同時改多個參數時，總偏移量仍受限
@@ -618,6 +637,9 @@ def main():
     ap.add_argument("--epochs", type=int, default=None, help="訓練 Epochs 數（預設依資料量自動決定）")
     ap.add_argument("--trust-radius", type=float, default=0.15,
                     help="4 個以上參數時，只搜尋離 CST 樣本正規化距離 ≤ 此值的組合（0.15 ≈ 參數範圍的 15%%）")
+    ap.add_argument("--search-scope", default="doe", choices=["doe", "all"],
+                    help="4 個以上參數時的搜尋範圍：doe = 只在多參數資料（DOE、verify）附近且不超出它們的範圍；"
+                         "all = 舊做法，所有 CST 樣本附近（會沿單參數掃描線外推）")
     ap.add_argument("--n-ensemble", type=int, default=5, help="集成模型數量 (計算信心區間)")
     ap.add_argument("--skip-validate", action="store_true", help="跳過留一驗證")
     args = ap.parse_args()
@@ -741,7 +763,8 @@ def main():
     plot_sweeps(runs, design_params, models, norm, bands, sweeps_path)
     print(f"  各掃描線 CST vs 代理模型熱圖已存：{sweeps_path}")
 
-    param_grid, grid_axes = generate_search_grid(runs, design_params, trust_radius=args.trust_radius)
+    param_grid, grid_axes = generate_search_grid(runs, design_params, trust_radius=args.trust_radius,
+                                                 scope=args.search_scope)
     fine_freq = np.linspace(freq[0], freq[-1], len(freq))
     mean_curves, std_curves = predict_curves_batch(models, norm, param_grid, fine_freq)
 
@@ -753,7 +776,14 @@ def main():
 
     print(f"=== 代理模型細掃設計空間 {design_params} (共搜尋 {len(param_grid)} 組參數組合) ===")
     if len(design_params) >= 4:
-        print(f"  (只搜尋離 CST 樣本 {args.trust_radius:.0%} 參數範圍以內的組合；遠離資料的組合模型沒有依據)")
+        if args.search_scope == "doe":
+            mp = multi_param_runs(runs, design_params) or runs
+            box = ", ".join(f"{k} {min(r['params'][k] for r in mp):g}–{max(r['params'][k] for r in mp):g}"
+                            for k in design_params)
+            print(f"  (只搜尋離多參數 CST 樣本（{len(mp)} 組 DOE / verify）{args.trust_radius:.0%} 參數範圍以內、"
+                  f"且不超出它們範圍的組合：{box})")
+        else:
+            print(f"  (只搜尋離 CST 樣本 {args.trust_radius:.0%} 參數範圍以內的組合；遠離資料的組合模型沒有依據)")
     print(f"目標：{args.band} 頻段 S11 < {S11_GOAL_DB} dB 的均衡覆蓋率最大")
     for rank, i in enumerate(order[:5], 1):
         m = metrics[i]
