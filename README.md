@@ -10,14 +10,14 @@
 | `iterative_train.py` | 疊代微調：補跑 CST 後把新檔丟進 `data/`，在既有模型上微調，不用從頭訓練 |
 | `compare_verify.py` | CST 驗證結果 vs 模型預測自動比對：印出覆蓋率、−10 dB 邊界、共振頻率、RMSE、不確定性校準，畫比對圖並追加紀錄到 `outputs/verify_log.csv` |
 | `tolerance.py` | 製程容差分析：以 CST 實測過的設計為名目點做 Monte Carlo，估計尺寸誤差下的良率、單一參數敏感度，輸出 `outputs/tolerance_<檔名>.png` |
-| `cst/` | `make_doe.py --batch N` 產生第 N 批多參數拉丁超立方取樣清單（`doe_batchN.csv`）與對應的 CST macro（第 1 批 `run_doe.bas`、之後 `run_doe_batchN.bas`），macro 自動逐組模擬並匯出到 `data/doe_batchN.txt`；`run_verify_tol03.bas` / `run_verify_tol05.bas` 跑 verify_best3 的 ±0.3 / ±0.5 mm 最差角落，輸出 `data/verify_tol03.txt` / `verify_tol05.txt` |
+| `cst/` | `make_doe.py --batch N` 產生第 N 批多參數拉丁超立方取樣清單（`doe_batchN.csv`）與對應的 CST macro（第 1 批 `run_doe.bas`、之後 `run_doe_batchN.bas`），macro 自動逐組模擬並匯出到 `data/doe_batchN.txt`；`make_doe.py --test` 產生獨立測試集 `test_set.csv` / `run_test_set.bas`（輸出到 `data_test/test_set.txt`，不會被訓練）；`run_verify_tol03.bas` / `run_verify_tol05.bas` 跑 verify_best3 的 ±0.3 / ±0.5 mm 最差角落，輸出 `data/verify_tol03.txt` / `verify_tol05.txt` |
 | `train.py` | 入門範例：最小的 PyTorch 代理模型（手打假資料），學習用 |
 | `架構與目標.md` | 對照 ML 開發流程，說明每一步選了什麼方法、做到哪裡、下一步 |
 
 ## 環境
 
 ```bash
-pip install torch numpy matplotlib
+pip install -r requirements.txt   # torch 2.14.0、numpy 2.5.3、matplotlib 3.11.2（Python 3.14.6、CPU 實測）
 ```
 
 ## 使用
@@ -40,7 +40,8 @@ pip install torch numpy matplotlib
    產出：`antenna_surrogate.pth`（模型）、`outputs/validation.png`、`outputs/sweeps.png`（每條掃描線的 CST vs 模型熱圖）、`outputs/optimize_<band>.png`。
    未指定 `--epochs` 時會依資料量自動決定（每個模型約 1 萬次更新）；目前約 16 萬個頻點，對應 238 epochs。CPU 上整次約 45 分鐘，訓練時會印進度條與預估剩餘時間。
    留一驗證預設藏 21 條：單參數掃描檔各 1 條、每批 DOE 各 5 條、少於 3 組的驗證檔（`verify_*`）整檔藏起來。
-   信心區間（±σ）經過校正：σ = √[(s × 集成標準差)² + (β × 離最近訓練樣本的距離)²]，s、β 由留一驗證擬合並存在模型檔裡（目前 s = 3.20、β = 0）；用 `--skip-validate` 時不校正。
+   信心區間（±σ）經過校正：σ = √[(s × 集成標準差)² + (β × 離最近訓練樣本的距離)²]，s、β 由留一驗證擬合並存在模型檔裡（目前 s = 3.10、β = 0）；s 只用目標頻段 ±0.2 GHz 內、S11 在 −14 ~ −6 dB 附近的頻點校正，全頻校正值另外印出對照；用 `--skip-validate` 時不校正。
+   每個驗證點另外判定**設計用途準確度**：6E 覆蓋率誤差 ≤ 5 個百分點、−10 dB 邊緣誤差 ≤ 100 MHz（目前 21 點中 18 點通過）。
    4 個以上參數時，預設只在多參數資料（DOE、verify）涵蓋的範圍內搜尋：模型沿單參數掃描線外推到 DOE 範圍外時曾經嚴重高估。
 3. 把建議點拿去 CST 模擬，匯出成 `data/verify_bestN.txt`（或跑新一批 DOE），**在重訓之前**先比對：
 
@@ -57,13 +58,21 @@ pip install torch numpy matplotlib
    python tolerance.py data/verify_best3.txt --tol 0.1 0.3 --n 5000
    ```
 
-5. 比對完再重訓（`antenna_ml.py`）或微調：
+5. 獨立測試集（模型定版後才做）：
+
+   ```bash
+   python cst/make_doe.py --test                                  # 產生 8 個測試點與 CST macro
+   python compare_verify.py data_test/test_set.txt --note "獨立測試集"
+   ```
+
+   CST 結果放在 `data_test/`，**不要**放進 `data/`；一旦拿去訓練就不再獨立。多組比對時會印出總結（平均 RMSE、−10 dB 附近校準、設計用途通過率與 95% 信賴下限）。
+6. 比對完再重訓（`antenna_ml.py`）或微調：
 
    ```bash
    python iterative_train.py             # 預設 300 epochs、lr 5e-5
    ```
 
-`data/`、`outputs/`、`*.pth` 都在 `.gitignore` 內，不會上傳 GitHub；換電腦需自行複製資料，或重跑 `antenna_ml.py` 產生模型。
+`data/`、`data_test/`、`outputs/`、`*.pth` 都在 `.gitignore` 內，不會上傳 GitHub；換電腦需自行複製資料，或重跑 `antenna_ml.py` 產生模型。
 
 ## 整合紀錄（2026-11-10）
 
@@ -86,7 +95,8 @@ pip install torch numpy matplotlib
 每次 commit 後由 Claude 讀取變更內容整理，新的在最上面。
 
 <!-- CHANGELOG:START -->
-- **2026-11-20** 用全部 168 組重訓（納入 `verify_tol03`、`verify_tol05`）：留一驗證藏 21 條，平均 AI 1.20 vs baseline 1.66 dB；原本 18 點結果完全相同（1.13 dB），上升只是多了 3 個最佳區容差角落（1.96 / 1.94 / 1.00 dB，覆蓋率誤差 0–1.5 個百分點，誤差主要在共振谷深度），s 從 2.55 升到 3.20、β = 0。新第 1 名 [36.586, 13.481, 22.734, 14.537] 預測邊界餘裕 2.34 dB（±0.96），verify_best3 排第 5（預測 1.94，實測 1.91）；改進空間 ≤ 0.4 dB 小於不確定性，設計仍視為收斂。新模型重跑 `tolerance.py`：3 個角落估計與 CST 差 ≤ 0.11 dB（已是訓練點），±0.1 / 0.3 / 0.5 mm 良率 100 / 100 / 99.1%，Ymax 斜率從 +0.66 降到 +0.36 dB/mm。
+- **2026-11-20** 報告前定版：(1) 新增**設計用途準確度**（`design_accuracy`）當「模型夠準」的門檻：6E 覆蓋率誤差 ≤ 5 個百分點、−10 dB 邊緣誤差 ≤ 100 MHz（邊緣夾到頻段 ±0.2 GHz），留一驗證與 `compare_verify.py` 都會判定；留一驗證 21 點中 18 點通過（多參數 13/16），最佳區 4 點全過，未通過的是第 2 批 DOE 高 W_slot2、低 Ymax 角落 2 點與 verify_best2（偏保守）。(2) 不確定性改為只用 −10 dB 附近頻點校正：s = 3.10（全頻 3.20），幾乎沒變，因為 verify_best3 漏掉的 6.04 GHz 共振正好落在 −10 dB 附近（誤差保守）。(3) `cst/make_doe.py --test` 產生獨立測試集（verify_best3 周圍 ±1.5 mm、8 點、seed 2028），輸出到 `data_test/`，不會被訓練；`compare_verify.py` 多組時印總結與通過率 95% 信賴下限。(4) 新增 `requirements.txt`；`in_band_mask`、`main_segment` 移到 `antenna_ml.py` 共用。模型權重與上次相同（亂數種子固定），只有 s 改變，最佳化結果不變。模型就此定版。
+- **2026-11-20** `14d474c` 用全部 168 組重訓（納入 `verify_tol03`、`verify_tol05`）：留一驗證藏 21 條，平均 AI 1.20 vs baseline 1.66 dB；原本 18 點結果完全相同（1.13 dB），上升只是多了 3 個最佳區容差角落（1.96 / 1.94 / 1.00 dB，覆蓋率誤差 0–1.5 個百分點，誤差主要在共振谷深度），s 從 2.55 升到 3.20、β = 0。新第 1 名 [36.586, 13.481, 22.734, 14.537] 預測邊界餘裕 2.34 dB（±0.96），verify_best3 排第 5（預測 1.94，實測 1.91）；改進空間 ≤ 0.4 dB 小於不確定性，設計仍視為收斂。新模型重跑 `tolerance.py`：3 個角落估計與 CST 差 ≤ 0.11 dB（已是訓練點），±0.1 / 0.3 / 0.5 mm 良率 100 / 100 / 99.1%，Ymax 斜率從 +0.66 降到 +0.36 dB/mm。
 - **2026-11-20** `bfddf66` CST 驗證 ±0.5 mm 容差：新增 `cst/run_verify_tol05.bas`，跑 ±0.5 mm 估計最差的 2 個角落（兩種不同失效方式）。實測（`verify_tol05.txt`）：(−0.5, +0.5, −0.5, −0.5) = [36.47, 13.002, 22.444, 13.432] **6E 覆蓋率 98.5%、帶內最差 −9.37 dB**，−10 dB 下緣漂到 5.948 GHz（6E 下緣 5.925），容差估計 −9.97 dB，這種下緣漂移估計偏樂觀 0.6 dB；(+0.5, −0.5, −0.5, +0.5) = [37.47, 12.002, 22.444, 14.432] 100%、−10.28 dB（估 −10.16，偏保守，和 ±0.3 mm 同一種帶中凸起）。結論：±0.3 mm 確認安全，±0.5 mm 是容差上限，只有少數極端角落會掉覆蓋率（均勻 ±0.5 mm Monte Carlo 加 0.6 dB 懲罰後良率約 99.4%）。尚未重訓。
 - **2026-11-20** `15cd08a` CST 確認容差分析：新增 `cst/run_verify_tol03.bas`，跑 verify_best3 的 ±0.3 mm 最差角落 [37.27, 12.202, 23.244, 14.232]（W_slot1 +0.3、W_slot2 −0.3、W_slot3 +0.3、Ymax +0.3）。實測（`verify_tol03.txt`）6E 覆蓋率 100%、帶內最差 −11.32 dB、邊界餘裕 1.32 dB，比 `tolerance.py` 估計的 −10.98 dB 好 0.34 dB；名目 → 角落實測只退 0.59 dB（模型估 0.93 dB），容差估計偏保守。`compare_verify.py`：帶內 RMSE 2.11 dB，主要是共振谷深度（實測 −37.6 vs 模型 −27.5 dB），−10 dB 邊界誤差 < 0.012 GHz。結論：verify_best3 在 ±0.3 mm 製程誤差內確認可用。尚未重訓。
 - **2026-11-20** `8c88721` 新增 `tolerance.py` 製程容差分析：以 CST 實測設計為名目點，各設計變數加均勻分布 ±tol 誤差做 Monte Carlo；估計 S11 = CST 實測 + [模型(擾動) − 模型(名目)]，抵銷模型在名目點本身的偏差。verify_best3 在 ±0.05 / 0.1 / 0.2 / 0.3 mm 良率全部 100%，±0.3 mm 時帶內最差 S11 的 95 百分位 −11.39 dB（名目 −11.91）。最敏感的是 W_slot2（−1.40 dB/mm）與 Ymax（+0.66 dB/mm），W_slot1 幾乎無影響。±0.5 mm 的最差角落 −9.97 dB 才剛好過線。限制：不含板厚、介電常數；±0.3 mm 內是模型內插，未經 CST 確認。

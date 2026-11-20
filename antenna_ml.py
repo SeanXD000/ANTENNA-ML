@@ -417,6 +417,65 @@ def band_metrics(freq, s11, bands):
     )
 
 
+def in_band_mask(freq, bands, pad=0.0):
+    m = np.zeros_like(freq, dtype=bool)
+    for lo, hi in bands:
+        m |= (freq >= lo - pad) & (freq <= hi + pad)
+    return m
+
+
+def main_segment(freq, s11, bands):
+    """回傳與目標頻段重疊最多的 -10 dB 區段 (f_low, f_high, f_res, s11_res)；沒有則 None。"""
+    best, best_ov = None, 0.0
+    for seg in resonances(freq, s11, S11_GOAL_DB):
+        ov = sum(max(0.0, min(seg[1], hi) - max(seg[0], lo)) for lo, hi in bands)
+        if ov > best_ov:
+            best, best_ov = seg, ov
+    return best
+
+
+# 「模型夠準」的門檻：看設計真正用到的量，而不是整條曲線的 RMSE
+# （RMSE 主要被共振谷深度拉高，例如實測 -37 dB、預測 -27 dB，但谷多深不影響覆蓋率）
+ACC_COV_PP = 5.0      # 目標頻段覆蓋率誤差 ≤ 5 個百分點
+ACC_EDGE_GHZ = 0.10   # -10 dB 區段上下緣誤差 ≤ 100 MHz
+EDGE_PAD_GHZ = 0.20   # 邊緣先夾到「目標頻段 ±0.2 GHz」再比：離頻段更遠的邊緣不影響覆蓋率
+CAL_NEAR_DB = (-14.0, -6.0)  # 不確定性只在 -10 dB 附近校正（與樣本權重的邊界範圍相同）
+
+
+def design_accuracy(freq, s_true, s_pred, bands):
+    """設計用途的準確度：覆蓋率誤差（百分點）、-10 dB 上下緣誤差（GHz，夾到頻段 ±EDGE_PAD_GHZ），是否通過門檻。
+    兩邊都沒有 -10 dB 區段時邊緣不適用（只看覆蓋率）；只有一邊有則視為邊緣誤差無限大。"""
+    cov_err = (band_metrics(freq, s_pred, bands)["coverage"] - band_metrics(freq, s_true, bands)["coverage"]) * 100
+    lo_b, hi_b = min(b[0] for b in bands) - EDGE_PAD_GHZ, max(b[1] for b in bands) + EDGE_PAD_GHZ
+    seg_t, seg_p = main_segment(freq, s_true, bands), main_segment(freq, s_pred, bands)
+    if seg_t is None and seg_p is None:
+        e_lo = e_hi = None
+    elif seg_t is None or seg_p is None:
+        e_lo = e_hi = float("inf")
+    else:
+        clip = lambda x: min(max(x, lo_b), hi_b)
+        e_lo = clip(seg_p[0]) - clip(seg_t[0])
+        e_hi = clip(seg_p[1]) - clip(seg_t[1])
+    edge_ok = e_lo is None or (abs(e_lo) <= ACC_EDGE_GHZ and abs(e_hi) <= ACC_EDGE_GHZ)
+    return dict(cov_err_pp=float(cov_err), edge_lo_err=e_lo, edge_hi_err=e_hi,
+                ok=bool(abs(cov_err) <= ACC_COV_PP and edge_ok))
+
+
+def print_accuracy_summary(acc_rows):
+    """acc_rows：[(是否多參數樣本, design_accuracy 結果)]。分「全部」與「多參數（DOE / verify）」兩組統計。"""
+    print(f"  === 設計用途準確度（門檻：覆蓋率誤差 ≤ {ACC_COV_PP:g} 個百分點、-10 dB 邊緣誤差 ≤ "
+          f"{ACC_EDGE_GHZ * 1000:.0f} MHz，邊緣夾到頻段 ±{EDGE_PAD_GHZ:g} GHz）===")
+    for name, rows in (("全部", [a for _, a in acc_rows]), ("多參數 DOE / verify", [a for m, a in acc_rows if m])):
+        if not rows:
+            continue
+        cov = np.array([abs(a["cov_err_pp"]) for a in rows])
+        edges = [abs(e) for a in rows for e in (a["edge_lo_err"], a["edge_hi_err"])
+                 if e is not None and np.isfinite(e)]
+        e_str = f"、平均邊緣誤差 {np.mean(edges) * 1000:.0f} MHz（最大 {np.max(edges) * 1000:.0f}）" if edges else ""
+        print(f"    {name}：通過 {sum(a['ok'] for a in rows)}/{len(rows)}｜平均 |覆蓋率誤差| {cov.mean():.1f} 個百分點"
+              f"（最大 {cov.max():.1f}）{e_str}")
+
+
 def score(m):
     """綜合評分（越高越好），三項依重要性排列：
     1. 覆蓋率（0~100 分）：各子頻段平均覆蓋率 ×70% + 最差子頻段覆蓋率 ×30%
@@ -532,28 +591,50 @@ def group_by_source(runs):
     return groups
 
 
-def calibrate_uncertainty(models, norm, held, design_params):
+CAL_MIN_POINTS = 5   # 一個驗證樣本在 -10 dB 附近至少要有幾個頻點才拿來校正
+CAL_MIN_SAMPLES = 3  # 可用樣本太少就退回全頻校正
+
+
+def calibrate_uncertainty(models, norm, held, design_params, bands=None):
     """用驗證樣本校正不確定性，模型：σ² = (s × 集成標準差)² + (β × d)²
     - s：集成成員只差在亂數種子，彼此太像，標準差通常偏小 → 整體放大（限 1–10，只放大不縮小）
     - β：離訓練樣本越遠（外推）誤差越大，但集成標準差反應不出來 → 依距離 d 額外加寬（dB / 單位正規化距離）
     以各驗證樣本的 (均方誤差, 平均集成變異數, d) 做高斯負對數概似的網格搜尋。
-    norm 必須是校正前（sigma_scale=1、dist_coef=0）。回傳 (s, β, 各樣本 [(d, RMSE, 集成σ)])。
+    bands 有給時只用「目標頻段 ±EDGE_PAD_GHZ 內、且實測或預測落在 CAL_NEAR_DB（-14~-6 dB）」的頻點：
+    σ 真正被用到的地方是判斷有沒有過 -10 dB，共振谷深度的誤差（常達 10 dB）不該把 σ 撐大；
+    -10 dB 附近頻點不足 CAL_MIN_POINTS 的樣本（例如整段 -3 dB 的掃描線）不參與校正。
+    norm 必須是校正前（sigma_scale=1、dist_coef=0）。
+    回傳 (s, β, 各樣本 [(d, RMSE, 集成σ, 使用頻點數)]，未參與校正的樣本 RMSE、σ 為 None)。
     驗證樣本少、或都貼著訓練資料時，β 估不準，只是粗略值。"""
     rows = []
     for r in held:
         pv = [r["params"][k] for k in design_params]
         mean, std = predict_single(models, norm, pv, r["freq"])
-        rows.append((float(norm.nn_distance(pv)[0]), float(np.mean((mean - r["s11"]) ** 2)),
-                     float(np.mean(std ** 2))))
-    d, e2, v = (np.array(x) for x in zip(*rows))
+        if bands is None:
+            m = np.ones_like(r["freq"], dtype=bool)
+        else:
+            near = lambda s: (s >= CAL_NEAR_DB[0]) & (s <= CAL_NEAR_DB[1])
+            m = in_band_mask(r["freq"], bands, EDGE_PAD_GHZ) & (near(r["s11"]) | near(mean))
+        n = int(m.sum())
+        if n < (CAL_MIN_POINTS if bands is not None else 1):
+            rows.append((float(norm.nn_distance(pv)[0]), None, None, n))
+            continue
+        rows.append((float(norm.nn_distance(pv)[0]), float(np.mean((mean[m] - r["s11"][m]) ** 2)),
+                     float(np.mean(std[m] ** 2)), n))
+    used = [x for x in rows if x[1] is not None]
+    if bands is not None and len(used) < CAL_MIN_SAMPLES:
+        print(f"  （-10 dB 附近可用的驗證樣本只有 {len(used)} 個，改用全頻校正）")
+        return calibrate_uncertainty(models, norm, held, design_params, None)
+    d, e2, v = (np.array(x) for x in list(zip(*used))[:3])
     s_grid = np.linspace(1.0, 10.0, 181)
     b_grid = np.linspace(0.0, 30.0, 301)
     S, B = np.meshgrid(s_grid, b_grid, indexing="ij")
     var = S[..., None] ** 2 * v + B[..., None] ** 2 * d ** 2 + 1e-12
     nll = np.sum(np.log(var) + e2 / var, axis=-1)
     i, j = np.unravel_index(np.argmin(nll), nll.shape)
-    return float(s_grid[i]), float(b_grid[j]), [(di, float(np.sqrt(ei)), float(np.sqrt(vi)))
-                                                  for di, ei, vi in rows]
+    out = [(di, None if ei is None else float(np.sqrt(ei)), None if vi is None else float(np.sqrt(vi)), n)
+           for di, ei, vi, n in rows]
+    return float(s_grid[i]), float(b_grid[j]), out
 
 
 def swept_param(rs, design_params):
@@ -731,17 +812,25 @@ def main():
                                               epochs=args.epochs, n_ensemble=args.n_ensemble, verbose=True)
 
             # 不確定性校正：σ² = (s × 集成標準差)² + (β × 離訓練樣本距離)²，之後驗證圖與最終模型都套用
-            sigma_scale, dist_coef, cal_rows = calibrate_uncertainty(models_v, norm_v, held, design_params)
+            # 只用 -10 dB 附近的頻點校正（σ 是拿來判斷過不過 -10 dB 的）；全頻校正的 s 只印出來對照
+            s_full, b_full, _ = calibrate_uncertainty(models_v, norm_v, held, design_params)
+            sigma_scale, dist_coef, cal_rows = calibrate_uncertainty(models_v, norm_v, held, design_params, bands)
             norm_v.sigma_scale, norm_v.dist_coef = sigma_scale, dist_coef
-            print(f"  不確定性校正（依 {len(held)} 個驗證樣本）：集成標準差 × {sigma_scale:.2f}，"
-                  f"距離項 β = {dist_coef:.1f} dB / 單位正規化距離")
-            print(f"    {'樣本':<48}{'距離 d':>8}{'實際 RMSE':>11}{'集成 σ':>9}{'校正後 σ':>10}")
-            for r, (d_i, rmse_i, sig_i) in zip(held, cal_rows):
-                cal_i = np.sqrt((sigma_scale * sig_i) ** 2 + (dist_coef * d_i) ** 2)
+            n_used = sum(1 for x in cal_rows if x[1] is not None)
+            print(f"  不確定性校正（{len(held)} 個驗證樣本中 {n_used} 個在 {args.band} 頻段 ±{EDGE_PAD_GHZ:g} GHz 內有 "
+                  f"{CAL_NEAR_DB[0]:g}~{CAL_NEAR_DB[1]:g} dB 的頻點，只用這些頻點）：集成標準差 × {sigma_scale:.2f}，"
+                  f"距離項 β = {dist_coef:.1f} dB / 單位正規化距離（對照：全頻校正 s = {s_full:.2f}、β = {b_full:.1f}）")
+            print(f"    {'樣本':<48}{'距離 d':>8}{'頻點數':>7}{'實際 RMSE':>11}{'集成 σ':>9}{'校正後 σ':>10}")
+            for r, (d_i, rmse_i, sig_i, n_i) in zip(held, cal_rows):
                 p_str = format_params(design_params, [r["params"][k] for k in design_params])
-                print(f"    {p_str:<48}{d_i:>8.3f}{rmse_i:>11.2f}{sig_i:>9.2f}{cal_i:>10.2f}")
+                if rmse_i is None:
+                    print(f"    {p_str:<48}{d_i:>8.3f}{n_i:>7d}{'（不參與）':>11}")
+                    continue
+                cal_i = np.sqrt((sigma_scale * sig_i) ** 2 + (dist_coef * d_i) ** 2)
+                print(f"    {p_str:<48}{d_i:>8.3f}{n_i:>7d}{rmse_i:>11.2f}{sig_i:>9.2f}{cal_i:>10.2f}")
 
-            base_rmses, ai_rmses = [], []
+            base_rmses, ai_rmses, acc_rows = [], [], []
+            multi_ids = {id(r) for r in multi_param_runs(runs, design_params)}
             fig, axes = plt.subplots(len(held), 1, figsize=(10, 3.8 * len(held)), squeeze=False)
             for ax, r in zip(axes[:, 0], held):
                 pv = [r["params"][k] for k in design_params]
@@ -760,6 +849,13 @@ def main():
                       f"(平均不確定性 ±{np.mean(pred_std):.2f} dB)")
                 print(f"      基準(內插) RMSE = {base_rmse:.2f} dB，覆蓋率 {base_cov * 100:.1f}%  [{base_how}]  "
                       f"→ AI {'較好' if rmse < base_rmse else '較差'} ({rmse / max(base_rmse, 1e-9):.2f}× 基準)")
+                acc = design_accuracy(r["freq"], r["s11"], pred_mean, bands)
+                acc_rows.append((id(r) in multi_ids, acc))
+                e_str = ("-10 dB 區段：兩邊都沒有" if acc["edge_lo_err"] is None else
+                         "-10 dB 區段：只有一邊有" if np.isinf(acc["edge_lo_err"]) else
+                         f"-10 dB 邊緣誤差 下 {acc['edge_lo_err'] * 1000:+.0f} / 上 {acc['edge_hi_err'] * 1000:+.0f} MHz")
+                print(f"      設計用途：覆蓋率誤差 {acc['cov_err_pp']:+.1f} 個百分點｜{e_str}  → "
+                      f"{'通過' if acc['ok'] else '未通過'}")
 
                 ax.plot(r["freq"], r["s11"], "k-", lw=1.6, label="CST 模擬 (真實)")
                 ax.plot(r["freq"], pred_mean, "r--", lw=1.4, label="AI 集成預測 (平均)")
@@ -775,6 +871,7 @@ def main():
                 ax.grid(alpha=0.3)
 
             print(f"  平均 RMSE：AI {np.mean(ai_rmses):.3f} dB vs 基準(內插) {np.mean(base_rmses):.3f} dB")
+            print_accuracy_summary(acc_rows)
             fig.tight_layout()
             val_path = os.path.join(OUT_DIR, "validation.png")
             fig.savefig(val_path, dpi=140)

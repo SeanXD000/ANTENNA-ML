@@ -4,3 +4,4 @@ __pycache__/
 *.ai
 outputs/
 data/
+data_test/

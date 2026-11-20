@@ -23,8 +23,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from antenna_ml import (MODEL_PATH, OUT_DIR, S11_GOAL_DB, WIFI_BANDS, band_metrics,
-                        format_params, parse_cst_sweep, predict_single, resonances)
+from antenna_ml import (ACC_COV_PP, ACC_EDGE_GHZ, CAL_NEAR_DB, EDGE_PAD_GHZ, MODEL_PATH, OUT_DIR,
+                        S11_GOAL_DB, WIFI_BANDS, band_metrics, design_accuracy, format_params, in_band_mask,
+                        main_segment, parse_cst_sweep, predict_single, print_accuracy_summary)
 from iterative_train import load_checkpoint
 
 LOG_PATH = os.path.join(OUT_DIR, "verify_log.csv")
@@ -38,23 +39,6 @@ LOG_FIELDS = [
     "sigma_full_db", "sigma_band_db", "calib_ratio", "within_2sigma",
     "model_mtime", "note",
 ]
-
-
-def in_band_mask(freq, bands):
-    m = np.zeros_like(freq, dtype=bool)
-    for lo, hi in bands:
-        m |= (freq >= lo) & (freq <= hi)
-    return m
-
-
-def main_segment(freq, s11, bands):
-    """回傳與目標頻段重疊最多的 -10 dB 區段 (f_low, f_high, f_res, s11_res)；沒有則 None。"""
-    best, best_ov = None, 0.0
-    for seg in resonances(freq, s11, S11_GOAL_DB):
-        ov = sum(max(0.0, min(seg[1], hi) - max(seg[0], lo)) for lo, hi in bands)
-        if ov > best_ov:
-            best, best_ov = seg, ov
-    return best
 
 
 def fmt(x, spec=".3f"):
@@ -90,6 +74,11 @@ def compare_run(run, models, norm, design_params, fixed, bands):
     sigma_full = float(np.mean(std))
     sigma_band = float(np.mean(std[mb]))
     within = float(np.mean(np.abs(err) <= 2 * std))
+    # -10 dB 附近（頻段 ±EDGE_PAD_GHZ 內、實測或預測在 CAL_NEAR_DB）：模型的 σ 是依這些頻點校正的
+    near = lambda s: (s >= CAL_NEAR_DB[0]) & (s <= CAL_NEAR_DB[1])
+    mn = in_band_mask(freq, bands, EDGE_PAD_GHZ) & (near(s11) | near(pred))
+    ratio_near = (float(np.sqrt(np.mean(err[mn] ** 2)) / np.mean(std[mn]))
+                  if mn.sum() >= 5 and np.mean(std[mn]) > 1e-9 else None)
 
     return dict(
         params=format_params(design_params, pv),
@@ -105,6 +94,7 @@ def compare_run(run, models, norm, design_params, fixed, bands):
         sigma_full_db=sigma_full, sigma_band_db=sigma_band,
         calib_ratio=rmse_full / sigma_full if sigma_full > 1e-9 else None,
         within_2sigma=within * 100,
+        _acc=design_accuracy(freq, s11, pred, bands), _ratio_near=ratio_near, _n_near=int(mn.sum()),
         _freq=freq, _s11=s11, _pred=pred, _std=std,
     )
 
@@ -129,8 +119,16 @@ def print_report(r, band_name):
     ratio = r["calib_ratio"]
     print(f"  不確定性：模型自報平均 ±{r['sigma_full_db']:.2f} dB（帶內 ±{r['sigma_band_db']:.2f}）"
           f"｜實際誤差 / 自報 = {fmt(ratio, '.1f')} 倍｜誤差落在 ±2σ 內的頻點 {r['within_2sigma']:.0f}%")
-    if ratio is not None and ratio > 2:
-        print("  [注意]模型低估了不確定性（實際誤差超過自報的 2 倍）")
+    rn = r["_ratio_near"]
+    print(f"  -10 dB 附近（{r['_n_near']} 個頻點，σ 依這些頻點校正）：實際誤差 / 自報 = {fmt(rn, '.1f')} 倍")
+    if rn is not None and rn > 2:
+        print("  [注意]模型在 -10 dB 附近低估了不確定性（實際誤差超過自報的 2 倍）")
+    a = r["_acc"]
+    e_str = ("兩邊都沒有 -10 dB 區段" if a["edge_lo_err"] is None else "只有一邊有 -10 dB 區段"
+             if np.isinf(a["edge_lo_err"]) else
+             f"邊緣誤差 下 {a['edge_lo_err'] * 1000:+.0f} / 上 {a['edge_hi_err'] * 1000:+.0f} MHz")
+    print(f"  設計用途判定（覆蓋率誤差 ≤ {ACC_COV_PP:g} 個百分點、邊緣 ≤ {ACC_EDGE_GHZ * 1000:.0f} MHz）："
+          f"覆蓋率 {a['cov_err_pp']:+.1f}｜{e_str} → {'通過' if a['ok'] else '未通過'}")
 
 
 def plot_run(r, bands, title, out_path):
@@ -184,6 +182,7 @@ def main():
     model_time_str = datetime.datetime.fromtimestamp(model_mtime).strftime("%Y-%m-%d %H:%M")
     print(f"載入模型 {args.model}（{len(models)} 個集成成員，存檔時間 {model_time_str}）")
 
+    results = []
     for fp in args.files:
         runs = parse_cst_sweep(fp)
         name = os.path.splitext(os.path.basename(fp))[0]
@@ -199,6 +198,7 @@ def main():
             if len(runs) > 1:
                 print(f"\n  --- 第 {i} 組 ---")
             r = compare_run(run, models, norm, design_params, fixed, bands)
+            results.append(r)
             print_report(r, args.band)
             suffix = f"_{i}" if len(runs) > 1 else ""
             out_png = os.path.join(OUT_DIR, f"compare_{name}{suffix}.png")
@@ -209,6 +209,18 @@ def main():
                 append_log(dict(r, time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
                                 file=os.path.basename(fp), run=i, band=args.band,
                                 model_mtime=model_time_str, note=args.note))
+
+    if len(results) > 1:
+        print(f"\n=== 總結（{len(results)} 組）===")
+        print(f"  RMSE 平均：全頻 {np.mean([r['rmse_full_db'] for r in results]):.2f} dB｜"
+              f"帶內 {np.mean([r['rmse_band_db'] for r in results]):.2f} dB")
+        rn = [r["_ratio_near"] for r in results if r["_ratio_near"] is not None]
+        if rn:
+            print(f"  -10 dB 附近 實際誤差 / 自報 σ：中位數 {np.median(rn):.1f} 倍（1 倍 = 校準良好）")
+        print_accuracy_summary([(True, r["_acc"]) for r in results])
+        k, n = sum(r["_acc"]["ok"] for r in results), len(results)
+        if k == n:  # 全部通過時的單邊 95% 信賴下限（Clopper-Pearson）：0.05^(1/n)
+            print(f"    全部通過：真實通過率的 95% 信賴下限約 {0.05 ** (1 / n) * 100:.0f}%（樣本數 {n}）")
 
     if not args.no_log:
         print(f"\n紀錄已追加到 {LOG_PATH}")
