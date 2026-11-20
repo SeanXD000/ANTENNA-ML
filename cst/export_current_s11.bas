@@ -9,7 +9,7 @@
 ' ============================================================
 Option Explicit
 
-Const OUT_FILE As String = "C:\attena\antenna-ml\data_50ohm\verify_best3_50ohm.txt"
+Const OUT_FILE As String = "C:\attena\antenna-ml\data_50ohm\verify_best3_50ohm_newport.txt"
 Const S11_TREE As String = "1D Results\S-Parameters\S1,1"
 
 Sub Main()
