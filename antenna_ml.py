@@ -701,9 +701,14 @@ def interp_baseline(train, target_params, design_params, freq):
 
 def plot_sweeps(runs, design_params, models, norm, bands, out_path):
     """每個來源檔（一條掃描線）畫一列：左 = CST 原始 S11 熱圖，右 = 代理模型在同一條線上的預測。
-    兼做資料探索 (EDA)：看共振頻率怎麼隨參數移動。"""
-    groups = group_by_source(runs)
+    兼做資料探索 (EDA)：看共振頻率怎麼隨參數移動。
+    只畫單參數掃描檔：DOE 每列四個參數都在變，右欄只能畫某個固定切面，兩欄無法比較；
+    少於 3 組的驗證檔（verify_*）畫不出熱圖，只會留下空白列。"""
+    multi = {id(r) for r in multi_param_runs(runs, design_params)}
+    groups = {src: rs for src, rs in group_by_source(runs).items() if not any(id(r) in multi for r in rs)}
     n = len(groups)
+    if n == 0:
+        return
     fig, axes = plt.subplots(n, 2, figsize=(13, 3.4 * n), squeeze=False)
     for row, src in enumerate(sorted(groups)):
         rs = groups[src]
