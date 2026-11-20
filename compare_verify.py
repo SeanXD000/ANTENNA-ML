@@ -163,6 +163,23 @@ def append_log(row):
                     for k, v in row.items() if k in LOG_FIELDS})
 
 
+def clopper_pearson(k, n, alpha=0.05):
+    """二項比例 k/n 的 Clopper-Pearson 雙邊 (1-alpha) 信賴區間；alpha=0.10 的下限 = 單邊 95% 下限。
+    不用 scipy：直接對二項累積機率二分搜尋。"""
+    from math import comb
+    cdf = lambda j, p: sum(comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(j + 1))
+
+    def solve(f):  # f(p) 隨 p 單調遞增，找 f(p) = 0
+        a, b = 0.0, 1.0
+        for _ in range(60):
+            m = (a + b) / 2
+            a, b = (m, b) if f(m) < 0 else (a, m)
+        return (a + b) / 2
+    lo = 0.0 if k == 0 else solve(lambda p: (1 - cdf(k - 1, p)) - alpha / 2)
+    hi = 1.0 if k == n else solve(lambda p: alpha / 2 - cdf(k, p))
+    return lo, hi
+
+
 def main():
     ap = argparse.ArgumentParser(description="CST 驗證結果 vs 模型預測比對")
     ap.add_argument("files", nargs="+", help="CST 匯出的驗證檔（如 data/verify_best3.txt）")
@@ -219,8 +236,9 @@ def main():
             print(f"  -10 dB 附近 實際誤差 / 自報 σ：中位數 {np.median(rn):.1f} 倍（1 倍 = 校準良好）")
         print_accuracy_summary([(True, r["_acc"]) for r in results])
         k, n = sum(r["_acc"]["ok"] for r in results), len(results)
-        if k == n:  # 全部通過時的單邊 95% 信賴下限（Clopper-Pearson）：0.05^(1/n)
-            print(f"    全部通過：真實通過率的 95% 信賴下限約 {0.05 ** (1 / n) * 100:.0f}%（樣本數 {n}）")
+        lo, hi = clopper_pearson(k, n)
+        print(f"    通過率 {k}/{n} = {k / n * 100:.0f}%，95% 信賴區間（Clopper-Pearson）{lo * 100:.0f}–{hi * 100:.0f}%"
+              f"｜單邊 95% 下限 {clopper_pearson(k, n, 0.10)[0] * 100:.0f}%")
 
     if not args.no_log:
         print(f"\n紀錄已追加到 {LOG_PATH}")
