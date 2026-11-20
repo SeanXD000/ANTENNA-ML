@@ -10,7 +10,7 @@
 | `iterative_train.py` | 疊代微調：補跑 CST 後把新檔丟進 `data/`，在既有模型上微調，不用從頭訓練 |
 | `compare_verify.py` | CST 驗證結果 vs 模型預測自動比對：印出覆蓋率、−10 dB 邊界、共振頻率、RMSE、不確定性校準，畫比對圖並追加紀錄到 `outputs/verify_log.csv` |
 | `tolerance.py` | 製程容差分析：以 CST 實測過的設計為名目點做 Monte Carlo，估計尺寸誤差下的良率、單一參數敏感度，輸出 `outputs/tolerance_<檔名>.png` |
-| `cst/` | `make_doe.py --batch N` 產生第 N 批多參數拉丁超立方取樣清單（`doe_batchN.csv`）與對應的 CST macro（第 1 批 `run_doe.bas`、之後 `run_doe_batchN.bas`），macro 自動逐組模擬並匯出到 `data/doe_batchN.txt`；`run_verify_tol03.bas` 跑 verify_best3 的 ±0.3 mm 最差角落，輸出 `data/verify_tol03.txt` |
+| `cst/` | `make_doe.py --batch N` 產生第 N 批多參數拉丁超立方取樣清單（`doe_batchN.csv`）與對應的 CST macro（第 1 批 `run_doe.bas`、之後 `run_doe_batchN.bas`），macro 自動逐組模擬並匯出到 `data/doe_batchN.txt`；`run_verify_tol03.bas` / `run_verify_tol05.bas` 跑 verify_best3 的 ±0.3 / ±0.5 mm 最差角落，輸出 `data/verify_tol03.txt` / `verify_tol05.txt` |
 | `train.py` | 入門範例：最小的 PyTorch 代理模型（手打假資料），學習用 |
 | `架構與目標.md` | 對照 ML 開發流程，說明每一步選了什麼方法、做到哪裡、下一步 |
 
@@ -23,8 +23,8 @@ pip install torch numpy matplotlib
 ## 使用
 
 1. 把 CST 參數掃描匯出的 `.txt` / `.dat` 放進 `data/`（格式：每組模擬以 `#Parameters = {...}` 開頭，接著是「頻率 GHz、S11 dB」兩欄）。
-   - 目前的資料是槽孔天線（設計變數 `W_slot1`、`W_slot2`、`W_slot3`、`Ymax`，2–8 GHz）：4 個單參數掃描、`Ymax(12.5_18)` 補掃、4 參數 DOE 兩批各 25 組（`doe_batch1`、`doe_batch2`）、建議最佳點的 CST 驗證（`verify_best`、`verify_best2`、`verify_best3`），共 165 組；另有容差驗證 `verify_tol03`（尚未納入訓練）。
-   - **目前最佳設計**：`verify_best3` [W_slot1=36.97, W_slot2=12.502, W_slot3=22.944, Ymax=13.932]，CST 實測 6E 覆蓋率 100%、帶內最差點 −11.91 dB（邊界餘裕 1.91 dB）、−10 dB 頻寬 5.864–7.856 GHz。4 個參數各偏 ±0.3 mm 的最差角落 CST 實測 −11.32 dB，仍 100% 覆蓋。
+   - 目前的資料是槽孔天線（設計變數 `W_slot1`、`W_slot2`、`W_slot3`、`Ymax`，2–8 GHz）：4 個單參數掃描、`Ymax(12.5_18)` 補掃、4 參數 DOE 兩批各 25 組（`doe_batch1`、`doe_batch2`）、建議最佳點的 CST 驗證（`verify_best`、`verify_best2`、`verify_best3`），共 165 組；另有容差驗證 `verify_tol03`、`verify_tol05`（3 組，尚未納入訓練）。
+   - **目前最佳設計**：`verify_best3` [W_slot1=36.97, W_slot2=12.502, W_slot3=22.944, Ymax=13.932]，CST 實測 6E 覆蓋率 100%、帶內最差點 −11.91 dB（邊界餘裕 1.91 dB）、−10 dB 頻寬 5.864–7.856 GHz。4 個參數各偏 ±0.3 mm 的最差角落 CST 實測 −11.32 dB，仍 100% 覆蓋；±0.5 mm 最差角落實測 98.5%（−9.37 dB），容差上限約 ±0.5 mm。
    - 舊天線的 `W4(0_13).txt` 參數名稱不同，預設會被略過（`--exclude`，預設 `W4*`）。若混入參數名稱不一致的檔案，程式會停下來並列出是哪些檔案。
 2. 訓練 + 最佳化：
 
@@ -86,7 +86,8 @@ pip install torch numpy matplotlib
 每次 commit 後由 Claude 讀取變更內容整理，新的在最上面。
 
 <!-- CHANGELOG:START -->
-- **2026-11-20** CST 確認容差分析：新增 `cst/run_verify_tol03.bas`，跑 verify_best3 的 ±0.3 mm 最差角落 [37.27, 12.202, 23.244, 14.232]（W_slot1 +0.3、W_slot2 −0.3、W_slot3 +0.3、Ymax +0.3）。實測（`verify_tol03.txt`）6E 覆蓋率 100%、帶內最差 −11.32 dB、邊界餘裕 1.32 dB，比 `tolerance.py` 估計的 −10.98 dB 好 0.34 dB；名目 → 角落實測只退 0.59 dB（模型估 0.93 dB），容差估計偏保守。`compare_verify.py`：帶內 RMSE 2.11 dB，主要是共振谷深度（實測 −37.6 vs 模型 −27.5 dB），−10 dB 邊界誤差 < 0.012 GHz。結論：verify_best3 在 ±0.3 mm 製程誤差內確認可用。尚未重訓。
+- **2026-11-20** CST 驗證 ±0.5 mm 容差：新增 `cst/run_verify_tol05.bas`，跑 ±0.5 mm 估計最差的 2 個角落（兩種不同失效方式）。實測（`verify_tol05.txt`）：(−0.5, +0.5, −0.5, −0.5) = [36.47, 13.002, 22.444, 13.432] **6E 覆蓋率 98.5%、帶內最差 −9.37 dB**，−10 dB 下緣漂到 5.948 GHz（6E 下緣 5.925），容差估計 −9.97 dB，這種下緣漂移估計偏樂觀 0.6 dB；(+0.5, −0.5, −0.5, +0.5) = [37.47, 12.002, 22.444, 14.432] 100%、−10.28 dB（估 −10.16，偏保守，和 ±0.3 mm 同一種帶中凸起）。結論：±0.3 mm 確認安全，±0.5 mm 是容差上限，只有少數極端角落會掉覆蓋率（均勻 ±0.5 mm Monte Carlo 加 0.6 dB 懲罰後良率約 99.4%）。尚未重訓。
+- **2026-11-20** `15cd08a` CST 確認容差分析：新增 `cst/run_verify_tol03.bas`，跑 verify_best3 的 ±0.3 mm 最差角落 [37.27, 12.202, 23.244, 14.232]（W_slot1 +0.3、W_slot2 −0.3、W_slot3 +0.3、Ymax +0.3）。實測（`verify_tol03.txt`）6E 覆蓋率 100%、帶內最差 −11.32 dB、邊界餘裕 1.32 dB，比 `tolerance.py` 估計的 −10.98 dB 好 0.34 dB；名目 → 角落實測只退 0.59 dB（模型估 0.93 dB），容差估計偏保守。`compare_verify.py`：帶內 RMSE 2.11 dB，主要是共振谷深度（實測 −37.6 vs 模型 −27.5 dB），−10 dB 邊界誤差 < 0.012 GHz。結論：verify_best3 在 ±0.3 mm 製程誤差內確認可用。尚未重訓。
 - **2026-11-20** `8c88721` 新增 `tolerance.py` 製程容差分析：以 CST 實測設計為名目點，各設計變數加均勻分布 ±tol 誤差做 Monte Carlo；估計 S11 = CST 實測 + [模型(擾動) − 模型(名目)]，抵銷模型在名目點本身的偏差。verify_best3 在 ±0.05 / 0.1 / 0.2 / 0.3 mm 良率全部 100%，±0.3 mm 時帶內最差 S11 的 95 百分位 −11.39 dB（名目 −11.91）。最敏感的是 W_slot2（−1.40 dB/mm）與 Ymax（+0.66 dB/mm），W_slot1 幾乎無影響。±0.5 mm 的最差角落 −9.97 dB 才剛好過線。限制：不含板厚、介電常數；±0.3 mm 內是模型內插，未經 CST 確認。
 - **2026-11-20** `7570ffc` 驗證新分數第 1 名並重訓，加進度條：[36.97, 12.502, 22.944, 13.932] 在 CST 實測（`verify_best3.txt`），重訓前用 `compare_verify.py` 比對：6E 覆蓋率 100%（預測 100%）、**邊界餘裕 1.91 dB**（預測 2.05，verify_best2 只有 0.46）、平均 −17.02 dB、−10 dB 頻寬 5.864–7.856 GHz（邊界誤差 < 0.08 GHz）；模型漏掉 6.04 GHz 的第二個共振谷，帶內 RMSE 2.53 dB，但誤差方向是保守的。**verify_best3 成為目前最佳設計。** 165 組重訓：18 個驗證點平均 AI 1.13 vs baseline 1.61 dB，s = 2.55。新前 5 名預測邊界餘裕 2.0–2.3 dB，只比實測多 0.1–0.4 dB（小於不確定性），設計已收斂。另外 `antenna_ml.py`、`iterative_train.py` 訓練時每 20% 印一行進度條（百分比、經過時間、預估剩餘），輸出導到檔案也逐行寫入。
 - **2026-11-20** `0f61ba4` 檢討綜合分數：舊版 `覆蓋率×100 − 平均 dB` 讓 1 個百分點覆蓋率 = 1 dB 平均深度，深谷可以換掉覆蓋率（97.5% + 平均 −23 dB 贏過 100% + −17 dB）。新版 = `覆蓋率×70 + 最差子頻段覆蓋率×30 + 邊界餘裕 − 0.2 × 封頂平均 dB`：邊界餘裕是帶內最差點比 −10 dB 低多少（0–5 dB），只有 100% 覆蓋才會 > 0，所以永遠不會拿覆蓋率去換；平均 dB 每點最深只算到 −20 dB，只當 tie-breaker。中間試過只用封頂深度當次要項，結果前 5 名全部擠到 DOE 邊界 W_slot1=36.1，所以改用邊界餘裕。新前 5 名全部 6E 100%、邊界餘裕約 2 dB（verify_best2 實測 0.46 dB）、±0.5 dB，不貼邊界；第 1 名 [36.97, 12.502, 22.944, 13.932]。輸出加印邊界餘裕。
